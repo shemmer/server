@@ -2073,7 +2073,6 @@ public:
     delayed_lock= global_system_variables.low_priority_updates ?
                                           TL_WRITE_LOW_PRIORITY : TL_WRITE;
     mysql_mutex_unlock(&LOCK_thread_count);
-    thread_safe_increment32(&thread_count);
     DBUG_VOID_RETURN;
   }
   ~Delayed_insert()
@@ -2236,8 +2235,12 @@ bool delayed_get_table(THD *thd, MDL_request *grl_protection_request,
     */
     if (! (di= find_handler(thd, table_list)))
     {
+      inc_thread_count();
       if (!(di= new Delayed_insert(thd->lex->current_select)))
+      {
+        dec_thread_count();
         goto end_create;
+      }
 
       /*
         Annotating delayed inserts is not supported.

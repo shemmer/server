@@ -1403,14 +1403,7 @@ void CONNECT::close_and_delete()
   if (vio)
     vio_close(vio);
   if (thread_count_incremented)
-  {
-    /*
-      Normally this is handled by THD::unlink. As we haven't yet created
-      a THD and put it in the thread list, we have to manage counting here.
-    */
-    dec_thread_count();
     dec_connection_count(scheduler);
-  }
   statistic_increment(connection_errors_internal, &LOCK_status);
   statistic_increment(aborted_connects,&LOCK_status);
 
@@ -1433,24 +1426,10 @@ void CONNECT::close_with_error(uint sql_errno,
       net_send_error(thd, sql_errno, message, NULL);
     close_connection(thd, close_error);
     delete thd;
+    dec_thread_count();
     set_current_thd(0);
-    if (thread_count_incremented)
-    {
-      dec_thread_count();
-      dec_connection_count(scheduler);
-    }
-    delete this;
-    statistic_increment(connection_errors_internal, &LOCK_status);
-    statistic_increment(aborted_connects,&LOCK_status);
   }
-  else
-  {
-    /*
-      Out of memory; We can't generate an error, just close the connection
-      close_and_delete() will increment statistics.
-    */
-    close_and_delete();
-  }
+  close_and_delete();
 }
 
 
@@ -1481,20 +1460,19 @@ THD *CONNECT::create_thd(THD *thd)
     */
     thd->thread_id= thd->variables.pseudo_thread_id= thread_id;
   }
-  else if (!(thd= new THD(thread_id)))
-    DBUG_RETURN(0);
+  else
+  {
+    inc_thread_count();
+    if (!(thd= new THD(thread_id)))
+      goto err;
+  }
 
   set_current_thd(thd);
   res= my_net_init(&thd->net, vio, thd, MYF(MY_THREAD_SPECIFIC));
   vio= 0;                              // Vio now handled by thd
 
   if (res)
-  {
-    if (!thd_reused)
-      delete thd;
-    set_current_thd(0);
-    DBUG_RETURN(0);
-  }
+    goto err;
 
   init_net_server_extension(thd);
 
@@ -1503,4 +1481,12 @@ THD *CONNECT::create_thd(THD *thd)
   thd->scheduler=          scheduler;
   thd->real_id=            real_id;
   DBUG_RETURN(thd);
+err:
+  if (!thd_reused)
+  {
+    delete thd;
+    dec_thread_count();
+  }
+  set_current_thd(0);
+  DBUG_RETURN(0);
 }

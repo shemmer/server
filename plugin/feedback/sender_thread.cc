@@ -91,7 +91,6 @@ static int prepare_for_fill(TABLE_LIST *tables)
   */
   thd->variables.pseudo_thread_id= thd->thread_id;
   mysql_mutex_lock(&LOCK_thread_count);
-  thread_count++;
   threads.append(thd);
   mysql_mutex_unlock(&LOCK_thread_count);
   thd->thread_stack= (char*) &tables;
@@ -208,8 +207,12 @@ static void send_report(const char *when)
       SELECT * FROM INFORMATION_SCHEMA.feedback is doing,
       read and concatenate table data into a String.
     */
+    inc_thread_count();
     if (!(thd= new THD(thd_thread_id)))
+    {
+      dec_thread_count();
       return;
+    }
 
     if (prepare_for_fill(&tables))
       goto ret;
@@ -263,12 +266,12 @@ ret:
     */
     mysql_mutex_lock(&LOCK_thread_count);
     thd->set_status_var_init();
-    thread_count--;
     thd->killed= KILL_CONNECTION;
     thd->unlink();
     mysql_cond_broadcast(&COND_thread_count);
     mysql_mutex_unlock(&LOCK_thread_count);
     delete thd;
+    dec_thread_count();
     thd= 0;
   }
 }

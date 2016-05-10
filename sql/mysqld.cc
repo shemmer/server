@@ -2924,6 +2924,12 @@ void dec_thread_count(void)
 }
 
 
+void inc_thread_count(void)
+{
+  thread_safe_increment32(&thread_count);
+}
+
+
 /*
   Send a signal to unblock close_conneciton() / rpl_slave_init_thread()
   if there is no more threads running with a THD attached
@@ -6426,7 +6432,6 @@ void create_thread_to_handle_connection(CONNECT *connect)
       /* Get thread from cache */
       thread_cache.push_back(connect);
       wake_thread++;
-      thread_safe_decrement32(&thread_count);
       mysql_cond_signal(&COND_thread_cache);
       mysql_mutex_unlock(&LOCK_thread_cache);
       DBUG_PRINT("info",("Thread created"));
@@ -6442,23 +6447,15 @@ void create_thread_to_handle_connection(CONNECT *connect)
 
   if ((error= mysql_thread_create(key_thread_one_connection,
                                   &connect->real_id, &connection_attrib,
-                                  handle_one_connection,
-                                  (void*) connect)))
+                                  handle_one_connection, (void*) connect)))
   {
     /* purecov: begin inspected */
-    DBUG_PRINT("error",
-               ("Can't create thread to handle request (error %d)",
+    DBUG_PRINT("error", ("Can't create thread to handle request (error %d)",
                 error));
-    dec_connection_count(connect->scheduler);
-    statistic_increment(aborted_connects,&LOCK_status);
-    statistic_increment(connection_errors_internal, &LOCK_status);
     my_snprintf(error_message_buff, sizeof(error_message_buff),
                 ER_DEFAULT(ER_CANT_CREATE_THREAD), error);
-    connect->close_with_error(ER_CANT_CREATE_THREAD,
-                              error_message_buff,
+    connect->close_with_error(ER_CANT_CREATE_THREAD, error_message_buff,
                               ER_OUT_OF_RESOURCES);
-    /* thread_count was incremented in create_new_thread() */
-    dec_thread_count();
     DBUG_VOID_RETURN;
     /* purecov: end */
   }
@@ -6510,7 +6507,6 @@ static void create_new_thread(CONNECT *connect)
 
   mysql_mutex_unlock(&LOCK_connection_count);
 
-  thread_safe_increment32(&thread_count);
   connect->thread_count_incremented= 1;
 
   /*
