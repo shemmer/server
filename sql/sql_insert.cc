@@ -2103,7 +2103,6 @@ public:
     my_free(thd.query());
     thd.security_ctx->user= 0;
     thd.security_ctx->host= 0;
-    dec_thread_count();
   }
 
   /* The following is for checking when we can delete ourselves */
@@ -2235,12 +2234,8 @@ bool delayed_get_table(THD *thd, MDL_request *grl_protection_request,
     */
     if (! (di= find_handler(thd, table_list)))
     {
-      inc_thread_count();
       if (!(di= new Delayed_insert(thd->lex->current_select)))
-      {
-        dec_thread_count();
         goto end_create;
-      }
 
       /*
         Annotating delayed inserts is not supported.

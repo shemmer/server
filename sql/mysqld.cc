@@ -494,7 +494,8 @@ ulong delay_key_write_options;
 uint protocol_version;
 uint lower_case_table_names;
 ulong tc_heuristic_recover= 0;
-int32 thread_count, service_thread_count;
+const volatile int32 thread_count= 0;
+int32 service_thread_count;
 int32 thread_running;
 int32 slave_open_temp_tables;
 ulong thread_created;
@@ -1734,7 +1735,7 @@ static void close_connections(void)
   */
   DBUG_PRINT("info", ("thread_count: %d", thread_count));
 
-  for (int i= 0; *(volatile int32*) &thread_count && i < 1000; i++)
+  for (int i= 0; thread_count && i < 1000; i++)
     my_sleep(20000);
 
   /*
@@ -2906,7 +2907,6 @@ void delete_running_thd(THD *thd)
 
   delete thd;
   dec_thread_running();
-  dec_thread_count();
 }
 
 /*
@@ -2915,20 +2915,6 @@ void delete_running_thd(THD *thd)
   SYNOPSIS
     dec_thread_count()
 */
-
-void dec_thread_count(void)
-{
-  DBUG_ASSERT(thread_count > 0);
-  thread_safe_decrement32(&thread_count);
-  signal_thd_deleted();
-}
-
-
-void inc_thread_count(void)
-{
-  thread_safe_increment32(&thread_count);
-}
-
 
 /*
   Send a signal to unblock close_conneciton() / rpl_slave_init_thread()
@@ -3122,7 +3108,6 @@ bool one_thread_per_connection_end(THD *thd, bool put_in_cache)
     if (!wsrep_applier && put_in_cache && cache_thread(thd))
       DBUG_RETURN(0);                             // Thread is reused
     delete thd;
-    dec_thread_count();
   }
 
   DBUG_PRINT("info", ("killing thread"));
@@ -6343,7 +6328,6 @@ static void bootstrap(MYSQL_FILE *file)
   my_net_init(&thd->net,(st_vio*) 0, (void*) 0, MYF(0));
   thd->max_client_packet_length= thd->net.max_packet;
   thd->security_ctx->master_access= ~(ulong)0;
-  thread_count++;                        // Safe as only one thread running
   in_bootstrap= TRUE;
 
   bootstrap_file=file;
@@ -8749,7 +8733,7 @@ static int mysql_init_variables(void)
   cleanup_done= 0;
   server_id_supplied= 0;
   test_flags= select_errors= dropping_tables= ha_open_options=0;
-  thread_count= thread_running= kill_cached_threads= wake_thread= 0;
+  thread_running= kill_cached_threads= wake_thread= 0;
   service_thread_count= 0;
   slave_open_temp_tables= 0;
   cached_thread_count= 0;

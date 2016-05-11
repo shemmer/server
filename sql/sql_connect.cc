@@ -1426,7 +1426,6 @@ void CONNECT::close_with_error(uint sql_errno,
       net_send_error(thd, sql_errno, message, NULL);
     close_connection(thd, close_error);
     delete thd;
-    dec_thread_count();
     set_current_thd(0);
   }
   close_and_delete();
@@ -1460,19 +1459,21 @@ THD *CONNECT::create_thd(THD *thd)
     */
     thd->thread_id= thd->variables.pseudo_thread_id= thread_id;
   }
-  else
-  {
-    inc_thread_count();
-    if (!(thd= new THD(thread_id)))
-      goto err;
-  }
+  else if (!(thd= new THD(thread_id)))
+    DBUG_RETURN(0);
 
   set_current_thd(thd);
   res= my_net_init(&thd->net, vio, thd, MYF(MY_THREAD_SPECIFIC));
   vio= 0;                              // Vio now handled by thd
 
   if (res)
-    goto err;
+  {
+    if (!thd_reused)
+      delete thd;
+    set_current_thd(0);
+    DBUG_RETURN(0);
+  }
+
 
   init_net_server_extension(thd);
 
@@ -1481,12 +1482,4 @@ THD *CONNECT::create_thd(THD *thd)
   thd->scheduler=          scheduler;
   thd->real_id=            real_id;
   DBUG_RETURN(thd);
-err:
-  if (!thd_reused)
-  {
-    delete thd;
-    dec_thread_count();
-  }
-  set_current_thd(0);
-  DBUG_RETURN(0);
 }

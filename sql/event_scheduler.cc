@@ -239,7 +239,6 @@ event_scheduler_thread(void *arg)
     thd->proc_info= "Clearing";
     net_end(&thd->net);
     delete thd;
-    dec_thread_count();
   }
 
   DBUG_LEAVE;                               // Against gcc warnings
@@ -395,12 +394,10 @@ Event_scheduler::start(int *err_no)
   if (state > INITIALIZED)
     goto end;
 
-  inc_thread_count();
   if (!(new_thd= new THD(next_thread_id())))
   {
     sql_print_error("Event Scheduler: Cannot initialize the scheduler thread");
     ret= true;
-    dec_thread_count();
     goto end;
   }
 
@@ -446,7 +443,6 @@ Event_scheduler::start(int *err_no)
     state= INITIALIZED;
     scheduler_thd= NULL;
     delete new_thd;
-    dec_thread_count();
 
     delete scheduler_param_value;
     ret= true;
@@ -544,7 +540,6 @@ Event_scheduler::execute_top(Event_queue_element_for_exec *event_name)
   int res= 0;
   DBUG_ENTER("Event_scheduler::execute_top");
 
-  inc_thread_count();
   if (!(new_thd= new THD(next_thread_id())))
     goto error;
 
@@ -590,8 +585,6 @@ Event_scheduler::execute_top(Event_queue_element_for_exec *event_name)
 error:
   DBUG_PRINT("error", ("Event_scheduler::execute_top() res: %d", res));
   delete new_thd;
-  dec_thread_count();
-
   delete event_name;
   DBUG_RETURN(TRUE);
 }

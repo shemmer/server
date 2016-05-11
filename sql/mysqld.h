@@ -578,7 +578,8 @@ extern mysql_cond_t COND_thread_count, COND_start_thread;
 extern mysql_cond_t COND_manager;
 extern mysql_cond_t COND_slave_init;
 extern int32 thread_running;
-extern int32 thread_count, service_thread_count;
+extern const volatile int32 thread_count;
+extern int32 service_thread_count;
 
 extern char *opt_ssl_ca, *opt_ssl_capath, *opt_ssl_cert, *opt_ssl_cipher,
   *opt_ssl_key, *opt_ssl_crl, *opt_ssl_crlpath;
@@ -766,8 +767,6 @@ inline void dec_thread_running()
 }
 
 extern void set_server_version(void);
-extern void dec_thread_count(void);
-extern void inc_thread_count(void);
 
 #if defined(MYSQL_DYNAMIC_PLUGIN) && defined(_WIN32)
 extern "C" THD *_current_thd_noinline();
