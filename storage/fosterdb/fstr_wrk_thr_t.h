@@ -19,6 +19,9 @@ const int FOSTER_SHUTDOWN=2;
 const int FOSTER_CREATE= 5;
 const int FOSTER_DELETE= 6;
 
+const int FOSTER_WRITE_ROW = 10;
+const int FOSTER_DELETE_ROW=11;
+const int FOSTER_UPDATE_ROW=12;
 
 
 struct base_request_t{
@@ -41,7 +44,23 @@ struct ddl_request_t : base_request_t{
     uint max_key_name_len;
 };
 
+struct write_request_t : base_request_t{
+    uchar* mysql_format_buf;
 
+    uchar* old_mysql_format_buf;
+
+    uchar* key_buf;
+
+    String table_name;
+
+    uchar* rec_buf;
+
+    uint maxlength;
+
+
+    TABLE* table;
+    uint max_key_len;
+};
 
 
 class fstr_wrk_thr_t : public smthread_t{
@@ -57,6 +76,12 @@ class fstr_wrk_thr_t : public smthread_t{
 
     w_rc_t create_physical_table();
     w_rc_t delete_table();
+
+
+    w_rc_t add_tuple();
+    w_rc_t delete_tuple();
+    w_rc_t update_tuple();
+
 
 #ifdef HAVE_PSI_INTERFACE
     PSI_mutex_key key_mutex_foster_wrker;
@@ -87,6 +112,12 @@ class fstr_wrk_thr_t : public smthread_t{
     bool _exit=false;
 
     bool _begin_tx;
+
+
+
+    int extract_key(uchar *key, int key_num, const uchar *record, TABLE* table);
+    
+    int pack_row(unsigned char *from, TABLE* table, unsigned char* buffer);
 public:
 
     mysql_mutex_t thread_mutex;

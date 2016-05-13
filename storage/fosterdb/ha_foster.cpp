@@ -343,6 +343,43 @@ int ha_foster::delete_table(const char *name)
 int ha_foster::write_row(uchar *buf) {
   int rc=0;
   DBUG_ENTER("ha_foster::write_row");
+  write_request_t *req = new write_request_t();
+
+  //Locking work request mutex
+  mysql_mutex_init(key_mutex_foster_wrk, &req->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
+  mysql_mutex_lock(&req->LOCK_work_mutex);
+
+  //Init the request condition -> used to signal the handler when the worker is done
+  mysql_cond_init(key_COND_work, &req->COND_work, NULL);
+
+
+  //Initializing values of the request
+  req->type = FOSTER_WRITE_ROW;
+  req->key_buf=key_buffer;
+  req->table_name.set(table_name, strlen(table_name), &my_charset_bin);
+
+  req->mysql_format_buf=buf;
+
+  if (fix_rec_buff(max_row_length(buf)))
+    DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+  req->rec_buf=record_buffer->buffer;
+
+  req->table = table;
+  req->max_key_len=max_key_len;
+
+  mysql_mutex_lock(&worker->thread_mutex);
+  worker->set_request(req);
+  worker->notify(true);
+  mysql_cond_broadcast(&worker->COND_worker);
+  mysql_mutex_unlock(&worker->thread_mutex);
+
+  while(!req->notified){
+    mysql_cond_wait(&req->COND_work, &req->LOCK_work_mutex);
+  }
+  mysql_mutex_unlock(&req->LOCK_work_mutex);
+  rc=req->err;
+  mysql_mutex_destroy(&req->LOCK_work_mutex);
+  delete(req);
   DBUG_RETURN(rc);
 }
 
@@ -351,6 +388,41 @@ int ha_foster::update_row(const uchar *old_data, uchar *new_data)
 {
   int rc=0;
   DBUG_ENTER("ha_foster::update_row");
+  write_request_t *req = new write_request_t();
+
+  //Locking work request mutex
+  mysql_mutex_init(key_mutex_foster_wrk, &req->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
+  mysql_mutex_lock(&req->LOCK_work_mutex);
+
+  //Init the request condition -> used to signal the handler when the worker is done
+  mysql_cond_init(key_COND_work, &req->COND_work, NULL);
+  req->table_name.set(table_name, strlen(table_name), &my_charset_bin);
+
+  req->type = FOSTER_UPDATE_ROW;
+  req->key_buf=key_buffer;
+
+  req->mysql_format_buf=new_data;
+  req->old_mysql_format_buf= const_cast<uchar*>(old_data);
+  req->rec_buf=record_buffer->buffer;
+  req->table=table;
+
+
+  mysql_mutex_lock(&worker->thread_mutex);
+  worker->set_request(req);
+  worker->notify(true);
+  mysql_cond_broadcast(&worker->COND_worker);
+  mysql_mutex_unlock(&worker->thread_mutex);
+
+  while(!req->notified){
+    mysql_cond_wait(&req->COND_work, &req->LOCK_work_mutex);
+  }
+
+  rc=req->err;
+
+  mysql_mutex_unlock(&req->LOCK_work_mutex);
+
+  mysql_mutex_destroy(&req->LOCK_work_mutex);
+  delete(req);
   DBUG_RETURN(rc);
 }
 
@@ -359,6 +431,46 @@ int ha_foster::delete_row(const uchar *buf)
 {
   int rc=0;
   DBUG_ENTER("ha_foster::delete_row");
+  write_request_t *req = new write_request_t();
+
+  //Locking work request mutex
+  mysql_mutex_init(key_mutex_foster_wrk, &req->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
+  mysql_mutex_lock(&req->LOCK_work_mutex);
+
+  //Init the request condition -> used to signal the handler when the worker is done
+  mysql_cond_init(key_COND_work, &req->COND_work, NULL);
+
+  req->type = FOSTER_DELETE_ROW;
+  req->table_name.set(table_name, strlen(table_name), &my_charset_bin);
+
+  req->table=table;
+
+  req->key_buf=key_buffer;
+  req->mysql_format_buf=const_cast<uchar*>(buf);
+
+  mysql_mutex_lock(&worker->thread_mutex);
+  worker->set_request(req);
+  worker->notify(true);
+  mysql_cond_broadcast(&worker->COND_worker);
+  mysql_mutex_unlock(&worker->thread_mutex);
+
+  while(!req->notified){
+    mysql_cond_wait(&req->COND_work, &req->LOCK_work_mutex);
+  }
+
+  mysql_mutex_unlock(&req->LOCK_work_mutex);
+
+  if(req->err==0){
+    mysql_mutex_destroy(&req->LOCK_work_mutex);
+    delete(req);
+    table->status=0;
+    rc= 0;
+  }else{
+
+    mysql_mutex_destroy(&req->LOCK_work_mutex);
+    delete(req);
+    rc=HA_ERR_END_OF_FILE;
+  }
   DBUG_RETURN(rc);
 }
 int ha_foster::index_init(uint idx, bool sorted){

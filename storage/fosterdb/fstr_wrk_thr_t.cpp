@@ -144,6 +144,12 @@ int fstr_wrk_thr_t::work_ACTIVE(){
             err=create_physical_table();break;
         case FOSTER_DELETE:
             err=delete_table(); break;
+        case FOSTER_WRITE_ROW:
+            err=add_tuple(); break;
+        case FOSTER_UPDATE_ROW:
+            update_tuple(); break;
+        case FOSTER_DELETE_ROW:
+            err=delete_tuple(); break;
         default: break;
     }
     if(err.is_error()) {
@@ -193,6 +199,84 @@ w_rc_t fstr_wrk_thr_t::startup() {
 }
 
 
+StoreID load_stid(String name, char* key_name, size_t key_name_length)
+{
+    uchar separator[4]={"###"};
+
+    size_t idx_name_buf_len = (size_t) name.length() +key_name_length+3;
+    uchar* idx_name_buf= (uchar*)malloc(idx_name_buf_len);
+
+    memcpy(idx_name_buf, name.ptr(), name.length());
+    idx_name_buf += name.length();
+
+    memcpy(idx_name_buf, separator, 3);
+    idx_name_buf+=3;
+
+    memcpy(idx_name_buf, key_name,  key_name_length);
+    idx_name_buf -= (name.length()+3);
+    w_keystr_t kstr;
+    kstr.construct_regularkey(idx_name_buf, idx_name_buf_len);
+    StoreID stid;
+    StoreID cat_stid =1;
+    smsize_t size = sizeof(StoreID);
+    bool found;
+    w_rc_t err = ss_m::find_assoc(cat_stid, kstr, &stid, size, found);
+    if(err.is_error()){
+        return NULL;
+    }
+    if (!found) {
+        return NULL;
+    }
+    return stid;
+}
+
+/**
+ * Extract a key with "key_num" from a record into "key"
+ */
+int fstr_wrk_thr_t::extract_key(uchar *key, int key_num, const uchar *record, TABLE* table)
+{
+    key_copy(key, const_cast<uchar*>(record), &table->key_info[key_num], 0);
+    return  table->key_info[key_num].key_length;
+}
+
+int fstr_wrk_thr_t::pack_row(uchar *from, TABLE* table, uchar* buffer)
+{
+    uchar* ptr;
+    /* Copy null bits */
+    memcpy(buffer, from, table->s->null_bytes);
+    ptr= buffer + table->s->null_bytes;
+
+    for (Field **field=table->field ; *field ; field++)
+    {
+        if (!((*field)->is_null()))
+            ptr= (*field)->pack(ptr, from + (*field)->offset(from));
+    }
+    return (unsigned int) (ptr - buffer);
+}
+/**
+ * Disk->Memory
+ */
+int fstr_wrk_thr_t::unpack_row(uchar *record, int row_len, uchar *&to, TABLE* table)
+{
+    /* Copy null bits */
+    const uchar* end= record+ row_len;
+    memcpy(to, record, table->s->null_bytes);
+    record+=table->s->null_bytes;
+    if (record > end)
+        return HA_ERR_WRONG_IN_RECORD;
+    for (Field **field=table->field ; *field ; field++)
+    {
+        if (!((*field)->is_null_in_record(to)))
+        {
+            if (!(record= const_cast<uchar*>((*field)
+                    ->unpack(to + (*field)->offset(table->record[0]),record, end))))
+                return HA_ERR_WRONG_IN_RECORD;
+        }
+    }
+    if (record != end)
+        return HA_ERR_WRONG_IN_RECORD;
+    return 0;
+}
 w_rc_t fstr_wrk_thr_t::create_physical_table(){
     DBUG_ENTER("fstr_wrk_thr::create_physical_table");
     ddl_request_t* r = static_cast<ddl_request_t*>(req);
@@ -252,4 +336,72 @@ w_rc_t fstr_wrk_thr_t::delete_table() {
         catalog_cursor->next();
     }while(!catalog_cursor->eof());
     return RCOK;
+}
+
+
+
+w_rc_t fstr_wrk_thr_t::add_tuple(){
+    w_rc_t rc = RCOK;
+    write_request_t* r = static_cast<write_request_t*>(req);
+    // build key dat
+    w_keystr_t kstr;
+    //Construct primary key of tuple in _key_buf
+    int ksz = extract_key(r->key_buf, 0, r->mysql_format_buf, r->table);
+    kstr.construct_regularkey(r->key_buf, ksz);
+    //Load stid of the primary idx
+    StoreID idx_stid = load_stid(r->table_name, r->table->key_info[0].name, r->table->key_info[0].name_length);
+    if(idx_stid==NULL) return RC(eNOTFOUND);
+    uint rec_buf_len =(uint) pack_row(r->mysql_format_buf, r->table, r->rec_buf);
+    //create assoc in primary index
+    rc=foster_handle->create_assoc(idx_stid, kstr, vec_t(r->rec_buf, rec_buf_len));
+    if(rc.is_error()) { return rc;}
+
+    W_COERCE(foster_handle->commit_xct());
+    return (rc);
+}
+
+w_rc_t fstr_wrk_thr_t::update_tuple(){
+    bool changed_pk=false;
+    write_request_t* r = static_cast<write_request_t*>(req);
+    StoreID pk_stid = load_stid(r->table_name, r->table->key_info[0].name, r->table->key_info[0].name_length);
+    w_keystr_t new_kstr;
+    int ksz = extract_key(r->key_buf, 0, r->mysql_format_buf, r->table);
+    new_kstr.construct_regularkey(r->key_buf, ksz);
+    uint rec_buf_len =(uint) pack_row(r->mysql_format_buf, r->table, r->rec_buf);
+    W_DO(foster_handle->put_assoc(pk_stid,new_kstr,vec_t(r->rec_buf, rec_buf_len)));
+
+    uchar* old_key_buffer;
+    old_key_buffer = (uchar*) my_malloc(r->table->s->key_info[0].key_part->length, MYF(MY_WME));
+    uint key_offset= r->table->s->key_info[0].key_part->offset;
+    memcpy(old_key_buffer, r->old_mysql_format_buf+key_offset, r->table->s->key_info[0].key_part->length);
+
+    //Build old key data of primary key
+    w_keystr_t old_kstr;
+    old_kstr.construct_regularkey(old_key_buffer, r->table->s->key_info[0].key_part->length);
+
+    if(old_kstr.compare(new_kstr)!=0){
+        W_DO(foster_handle->destroy_assoc(pk_stid, old_kstr));
+        changed_pk=true;
+    }
+
+    W_COERCE(foster_handle->commit_xct());
+    return RCOK;
+}
+
+w_rc_t fstr_wrk_thr_t::delete_tuple(){
+    w_rc_t rc = RCOK;
+    write_request_t* r = static_cast<write_request_t*>(req);
+    // build key dat
+    w_keystr_t kstr;
+    //Construct primary key of tuple in _key_buf
+    int ksz = extract_key(r->key_buf, 0, r->mysql_format_buf, r->table);
+    kstr.construct_regularkey(r->key_buf, ksz);
+    //Load stid of the primary idx
+    StoreID pk_stid = load_stid(r->table_name, r->table->key_info[0].name, r->table->key_info[0].name_length);
+    if(pk_stid==NULL) return RC(eNOTFOUND);
+    //create assoc in primary index
+    rc=ss_m::destroy_assoc(pk_stid,kstr);
+
+    W_COERCE(foster_handle->commit_xct());
+    return (rc);
 }
