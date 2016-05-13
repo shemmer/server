@@ -1,0 +1,3 @@
+[submodule "storage/fosterdb/zero"]
+	path = storage/fosterdb/zero
+	url = https://github.com/shemmer/zero.git
