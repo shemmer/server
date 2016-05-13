@@ -16,6 +16,11 @@ const int FOSTER_STARTUP =1;
 const int FOSTER_SHUTDOWN=2;
 
 
+const int FOSTER_CREATE= 5;
+const int FOSTER_DELETE= 6;
+
+
+
 struct base_request_t{
     mysql_cond_t COND_work;
     mysql_mutex_t LOCK_work_mutex;
@@ -27,6 +32,13 @@ struct base_request_t{
 };
 
 struct start_stop_request_t : base_request_t{
+};
+
+struct ddl_request_t : base_request_t{
+    String table_name;
+    TABLE* table;
+
+    uint max_key_name_len;
 };
 
 
@@ -43,6 +55,8 @@ class fstr_wrk_thr_t : public smthread_t{
 
     int work_ACTIVE();
 
+    w_rc_t create_physical_table();
+    w_rc_t delete_table();
 
 #ifdef HAVE_PSI_INTERFACE
     PSI_mutex_key key_mutex_foster_wrker;

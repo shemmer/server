@@ -140,6 +140,10 @@ int fstr_wrk_thr_t::work_ACTIVE(){
             err=startup();break;
         case FOSTER_SHUTDOWN:
             err=shutdown();break;
+        case FOSTER_CREATE:
+            err=create_physical_table();break;
+        case FOSTER_DELETE:
+            err=delete_table(); break;
         default: break;
     }
     if(err.is_error()) {
@@ -189,3 +193,63 @@ w_rc_t fstr_wrk_thr_t::startup() {
 }
 
 
+w_rc_t fstr_wrk_thr_t::create_physical_table(){
+    DBUG_ENTER("fstr_wrk_thr::create_physical_table");
+    ddl_request_t* r = static_cast<ddl_request_t*>(req);
+    // Add entry on catalog
+    StoreID cat_stid =1;
+    //Fill an idx_name buffer with tablename and idx name
+    uchar separator[4]={"###"};
+
+    uchar* idx_name_buf= (uchar*) my_malloc(r->table_name.length() + r->max_key_name_len + 3, MYF(MY_WME));
+    for(int i=0; i<r->table->s->keys; i++){
+
+        memcpy(idx_name_buf, r->table_name.ptr(), r->table_name.length());
+
+        idx_name_buf +=r->table_name.length();
+        memcpy(idx_name_buf, separator, 3);
+        idx_name_buf+=3;
+
+        memcpy(idx_name_buf, r->table->key_info[i].name, r->table->key_info[i].name_length);
+        idx_name_buf -= (r->table_name.length()+3);
+        StoreID stid_tmp;
+        //Create new index
+        W_COERCE(foster_handle->create_index(stid_tmp));
+        //Construct a key
+        w_keystr_t kstr;
+        kstr.construct_regularkey(idx_name_buf,r->table_name.length()+r->table->key_info[i].name_length+3);
+        //Create assoc in catalog
+        W_COERCE(foster_handle->create_assoc(cat_stid, kstr, vec_t(&stid_tmp, sizeof(StoreID))));
+    }
+    W_COERCE(foster_handle->commit_xct());
+    DBUG_RETURN(RCOK);
+}
+
+
+w_rc_t fstr_wrk_thr_t::delete_table() {
+    ddl_request_t* r = static_cast<ddl_request_t*>(req);
+    StoreID cat_stid =1;
+    uchar separator[4]={"###"};
+    w_keystr_t table_keystr;
+    table_keystr.construct_regularkey(r->table_name.ptr(), r->table_name.length());
+    w_keystr_t infimum, supremum;
+    infimum.construct_posinfkey();
+    supremum.construct_neginfkey();
+    bt_cursor_t* catalog_cursor = new bt_cursor_t(cat_stid, supremum, false, infimum, false, true);
+    catalog_cursor->next();
+    w_keystr_t curr;
+    do{
+        curr= catalog_cursor->key();
+        basic_string<unsigned char> data= curr.serialize_as_nonkeystr();
+        basic_string<unsigned char> separator_str =basic_string<unsigned char> (separator, 3);
+
+        //Drop every catalog entry with the same table name
+        if(data.compare(0,r->table_name.length()-1,table_keystr.serialize_as_nonkeystr(), 0,r->table_name.length()-1)){
+            if(data.compare(r->table_name.length(),3,separator_str,0,3)){
+                //foster_handle->destroy_assoc(cat_stid,curr);
+            }
+        }
+        catalog_cursor->next();
+    }while(!catalog_cursor->eof());
+    return RCOK;
+}

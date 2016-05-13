@@ -271,9 +271,74 @@ int ha_foster::create(const char *name, TABLE *table_arg,
 {
   int rc=0;
   DBUG_ENTER("ha_foster::create");
+
+  ddl_request_t* req = new ddl_request_t();
+  //Locking work request mutex
+  mysql_mutex_init(key_mutex_foster_wrk, &req->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
+  mysql_mutex_lock(&req->LOCK_work_mutex);
+
+  //Init the request condition -> used to signal the handler when the worker is done
+  mysql_cond_init(key_COND_work, &req->COND_work, NULL);
+  req->type=FOSTER_CREATE;
+  req->table_name.set(name, strlen(name), &my_charset_bin);
+  req->table= table_arg;
+
+  fstr_wrk_thr_t* func_worker = new fstr_wrk_thr_t(true);
+  mysql_mutex_lock(&func_worker->thread_mutex);
+  func_worker->set_request(req);
+  func_worker->notify(true);
+  mysql_cond_broadcast(&func_worker->COND_worker);
+  mysql_mutex_unlock(&func_worker->thread_mutex);
+
+  while(!req->notified){
+    mysql_cond_wait(&req->COND_work, &req->LOCK_work_mutex);
+  }
+
+  mysql_mutex_unlock(&req->LOCK_work_mutex);
+  func_worker->foster_exit();
+  delete(func_worker);
+
+  mysql_mutex_destroy(&req->LOCK_work_mutex);
+  delete(req);
   DBUG_RETURN(rc);
 }
 
+
+
+int ha_foster::delete_table(const char *name)
+{
+  int rc=0;
+  DBUG_ENTER("ha_foster::delete_table");
+  ddl_request_t* req = new ddl_request_t();
+  mysql_mutex_init(key_mutex_foster_wrk, &req->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
+  mysql_mutex_lock(&req->LOCK_work_mutex);
+
+  //Init the request condition -> used to signal the handler when the worker is done
+  mysql_cond_init(key_COND_work, &req->COND_work, NULL);
+
+  fstr_wrk_thr_t* del_worker = new fstr_wrk_thr_t(true);
+
+  req->type=FOSTER_DELETE;
+  req->table_name.set(name, strlen(name), &my_charset_bin);
+  req->table=table;
+
+  mysql_mutex_lock(&del_worker->thread_mutex);
+  del_worker->set_request(req);
+  del_worker->notify(true);
+  mysql_cond_broadcast(&del_worker ->COND_worker);
+  mysql_mutex_unlock(&del_worker->thread_mutex);
+
+  while(!req->notified){
+    mysql_cond_wait(&req->COND_work, &req->LOCK_work_mutex);
+  }
+  rc=req->err;
+  mysql_mutex_unlock(&req->LOCK_work_mutex);
+  mysql_mutex_destroy(&req->LOCK_work_mutex);
+  delete(req);
+  del_worker->foster_exit();
+  delete(del_worker);
+  DBUG_RETURN(rc);
+}
 
 int ha_foster::write_row(uchar *buf) {
   int rc=0;
@@ -428,12 +493,6 @@ THR_LOCK_DATA ** ha_foster::store_lock(THD *thd, THR_LOCK_DATA **to, enum thr_lo
 }
 
 
-int ha_foster::delete_table(const char *name)
-{
-  int rc=0;
-  DBUG_ENTER("ha_foster::delete_table");
-  DBUG_RETURN(rc);
-}
 
 
 
