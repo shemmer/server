@@ -483,7 +483,48 @@ int ha_foster::index_read_idx_map(uchar * buf, uint index, const uchar * key,
                        key_part_map keypart_map,
                        enum ha_rkey_function find_flag){
   int rc=0;
-  DBUG_ENTER("ha_foster::index_read");
+  DBUG_ENTER("ha_foster::index_read_idx_map");
+  read_request_t *req = new read_request_t();
+
+  //Locking work request mutex
+  mysql_mutex_init(key_mutex_foster_wrk, &req->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
+  mysql_mutex_lock(&req->LOCK_work_mutex);
+
+  //Init the request condition -> used to signal the handler when the worker is done
+  mysql_cond_init(key_COND_work, &req->COND_work, NULL);
+
+  req->type = FOSTER_IDX_READ;
+  req->table_name.set(table_name, strlen(table_name), &my_charset_bin);
+  req->key_buf = const_cast<uchar*>(key);
+  req->ksz=table->s->key_info[index].key_length;
+  req->find_flag=find_flag;
+  req->mysql_format_buf=buf;
+  req->table=table;
+
+  req->idx_no=index;
+
+  mysql_mutex_lock(&worker->thread_mutex);
+  worker->set_request(req);
+  worker->notify(true);
+  mysql_cond_broadcast(&worker->COND_worker);
+  mysql_mutex_unlock(&worker->thread_mutex);
+
+  while(!req->notified){
+    mysql_cond_wait(&req->COND_work, &req->LOCK_work_mutex);
+  }
+  mysql_mutex_unlock(&req->LOCK_work_mutex);
+
+  if(req->err==0){
+    rc=0;
+    mysql_mutex_destroy(&req->LOCK_work_mutex);
+    delete(req);
+    table->status=0;
+  }else{
+    mysql_mutex_destroy(&req->LOCK_work_mutex);
+    delete(req);
+    table->status = STATUS_NOT_FOUND;
+    rc=HA_ERR_END_OF_FILE;
+  }
   DBUG_RETURN(rc);
 }
 
@@ -491,6 +532,46 @@ int ha_foster::index_read(uchar *buf, const uchar *key, uint key_len,
                           enum ha_rkey_function find_flag){
   int rc=0;
   DBUG_ENTER("ha_foster::index_read");
+  read_request_t *req = new read_request_t();
+
+  //Locking work request mutex
+  mysql_mutex_init(key_mutex_foster_wrk, &req->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
+  mysql_mutex_lock(&req->LOCK_work_mutex);
+
+  //Init the request condition -> used to signal the handler when the worker is done
+  mysql_cond_init(key_COND_work, &req->COND_work, NULL);
+
+  req->type = FOSTER_IDX_READ;
+  req->table_name.set(table_name, strlen(table_name), &my_charset_bin);
+  req->key_buf = const_cast<uchar*>(key);
+  req->ksz=key_len;
+  req->find_flag=find_flag;
+  req->mysql_format_buf=buf;
+  req->table=table;
+
+  req->idx_no=active_index;
+
+  mysql_mutex_lock(&worker->thread_mutex);
+  worker->set_request(req);
+  worker->notify(true);
+  mysql_cond_broadcast(&worker->COND_worker);
+  mysql_mutex_unlock(&worker->thread_mutex);
+
+  while(!req->notified){
+    mysql_cond_wait(&req->COND_work, &req->LOCK_work_mutex);
+  }
+  mysql_mutex_unlock(&req->LOCK_work_mutex);
+  rc=req->err;
+  if(req->err==0){
+    mysql_mutex_destroy(&req->LOCK_work_mutex);
+    delete(req);
+    table->status=0;
+  }else{
+    mysql_mutex_destroy(&req->LOCK_work_mutex);
+    delete(req);
+    table->status = STATUS_NOT_FOUND;
+    rc=HA_ERR_END_OF_FILE;
+  }
   DBUG_RETURN(rc);
 }
 
@@ -498,6 +579,43 @@ int ha_foster::index_next(uchar *buf)
 {
   int rc=0;
   DBUG_ENTER("ha_foster::index_next");
+  read_request_t *req = new read_request_t();
+  table->status = 0;
+  //Locking work request mutex
+  mysql_mutex_init(key_mutex_foster_wrk, &req->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
+  mysql_mutex_lock(&req->LOCK_work_mutex);
+
+  //Init the request condition -> used to signal the handler when the worker is done
+  mysql_cond_init(key_COND_work, &req->COND_work, NULL);
+
+  req->type = FOSTER_IDX_NEXT;
+  req->table_name.set(table_name, strlen(table_name), &my_charset_bin);
+  req->mysql_format_buf=buf;
+  req->table=table;
+  req->idx_no=active_index;
+
+  mysql_mutex_lock(&worker->thread_mutex);
+  worker->set_request(req);
+  worker->notify(true);
+  mysql_cond_broadcast(&worker->COND_worker);
+  mysql_mutex_unlock(&worker->thread_mutex);
+
+  while(!req->notified){
+    mysql_cond_wait(&req->COND_work, &req->LOCK_work_mutex);
+  }
+  mysql_mutex_unlock(&req->LOCK_work_mutex);
+  rc=req->err;
+  if(req->err==0){
+//    rc= unpack_row(req->buf, req->len, buf);
+    mysql_mutex_destroy(&req->LOCK_work_mutex);
+    delete(req);
+    table->status=0;
+  }else{
+    mysql_mutex_destroy(&req->LOCK_work_mutex);
+    table->status = STATUS_NOT_FOUND;
+    delete(req);
+    rc= HA_ERR_END_OF_FILE;
+  }
   DBUG_RETURN(rc);
 }
 
@@ -510,15 +628,23 @@ int ha_foster::index_next(uchar *buf)
 
 int ha_foster::index_first(uchar *buf)
 {
-  DBUG_ENTER("ha_foster::index_first");
+
   int rc =0;
+  DBUG_ENTER("ha_foster::index_first");
+
+  rc= index_read(buf, 0, 0, HA_READ_KEY_OR_NEXT);
   DBUG_RETURN(rc);
 }
 
 
 int ha_foster::index_last(uchar *buf)
 {
+  int rc =0;
   DBUG_ENTER("ha_foster::index_last");
+
+  DBUG_RETURN(index_read(buf, 0, 0, HA_READ_PREFIX_LAST));
+
+  DBUG_RETURN(rc);
 }
 
 
@@ -526,6 +652,9 @@ int ha_foster::index_last(uchar *buf)
 int ha_foster::rnd_init(bool scan)
 {
   DBUG_ENTER("ha_foster::rnd_init");
+
+  first_row=true;
+  active_index=0;
   DBUG_RETURN(0);
 }
 
@@ -533,6 +662,51 @@ int ha_foster::rnd_next(uchar *buf)
 {
   int rc=0;
   DBUG_ENTER("ha_foster::rnd_next");
+
+  table->status = 0;
+  read_request_t *req = new read_request_t();
+
+  mysql_mutex_init(key_mutex_foster_wrk, &req->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
+  mysql_mutex_lock(&req->LOCK_work_mutex);
+
+  mysql_cond_init(key_COND_work, &req->COND_work, NULL);
+
+  req->table_name.set(table_name, strlen(table_name), &my_charset_bin);
+  req->mysql_format_buf=buf;
+  req->table=table;
+  req->idx_no=0;
+
+  if(first_row){
+    first_row=false;
+    req->key_buf =0;
+    req->ksz=0;
+    req->find_flag=HA_READ_KEY_OR_NEXT;
+    req->type = FOSTER_IDX_READ;
+  }else{
+    req->type = FOSTER_IDX_NEXT;
+  }
+
+  mysql_mutex_lock(&worker->thread_mutex);
+  worker->set_request(req);
+  worker->notify(true);
+  mysql_cond_broadcast(&worker->COND_worker);
+  mysql_mutex_unlock(&worker->thread_mutex);
+
+  while(!req->notified){
+    mysql_cond_wait(&req->COND_work, &req->LOCK_work_mutex);
+  }
+  mysql_mutex_unlock(&req->LOCK_work_mutex);
+  rc=req->err;
+  if(req->err==0){
+    mysql_mutex_destroy(&req->LOCK_work_mutex);
+    delete(req);
+    table->status=0;
+  }else{
+    mysql_mutex_destroy(&req->LOCK_work_mutex);
+    delete(req);
+    table->status = STATUS_NOT_FOUND;
+    rc=HA_ERR_END_OF_FILE;
+  }
   DBUG_RETURN(rc);
 }
 
@@ -541,6 +715,9 @@ int ha_foster::rnd_next(uchar *buf)
 void ha_foster::position(const uchar *record)
 {
   DBUG_ENTER("ha_foster::position");
+
+  key_copy(ref, const_cast<uchar*>(record),
+           &table->key_info[0], 0);
   DBUG_VOID_RETURN;
 }
 
@@ -549,6 +726,44 @@ int ha_foster::rnd_pos(uchar *buf, uchar *pos)
 {
   int rc=0;
   DBUG_ENTER("ha_foster::rnd_pos");
+  read_request_t *req = new read_request_t();
+
+  //Locking work request mutex
+  mysql_mutex_init(key_mutex_foster_wrk, &req->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
+  mysql_mutex_lock(&req->LOCK_work_mutex);
+
+  //Init the request condition -> used to signal the handler when the worker is done
+  mysql_cond_init(key_COND_work, &req->COND_work, NULL);
+
+  req->table_name.set(table_name, strlen(table_name), &my_charset_bin);
+  req->mysql_format_buf=buf;
+  req->table=table;
+  req->key_buf=pos;
+  req->ksz=ref_length;
+
+  req->type=FOSTER_POS_READ;
+
+  mysql_mutex_lock(&worker->thread_mutex);
+  worker->set_request(req);
+  worker->notify(true);
+  mysql_cond_broadcast(&worker->COND_worker);
+  mysql_mutex_unlock(&worker->thread_mutex);
+
+  while(!req->notified){
+    mysql_cond_wait(&req->COND_work, &req->LOCK_work_mutex);
+  }
+  mysql_mutex_unlock(&req->LOCK_work_mutex);
+  rc=req->err;
+  if(req->err==0){
+    mysql_mutex_destroy(&req->LOCK_work_mutex);
+    delete(req);
+    table->status=0;
+  }else{
+    mysql_mutex_destroy(&req->LOCK_work_mutex);
+    delete(req);
+    table->status = STATUS_NOT_FOUND;
+    rc=HA_ERR_END_OF_FILE;
+  }
   DBUG_RETURN(rc);
 }
 

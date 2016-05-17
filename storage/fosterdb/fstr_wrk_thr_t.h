@@ -23,6 +23,10 @@ const int FOSTER_WRITE_ROW = 10;
 const int FOSTER_DELETE_ROW=11;
 const int FOSTER_UPDATE_ROW=12;
 
+const int FOSTER_IDX_READ = 15;
+const int FOSTER_IDX_NEXT = 16;
+const int FOSTER_POS_READ = 18;
+
 
 struct base_request_t{
     mysql_cond_t COND_work;
@@ -63,9 +67,27 @@ struct write_request_t : base_request_t{
 };
 
 
+struct read_request_t : base_request_t{
+    ha_rkey_function find_flag;
+
+    uchar* key_buf;
+    uint ksz;
+
+    uchar* mysql_format_buf;
+
+    String table_name;
+    int len;
+
+    int idx_no;
+    TABLE* table;
+};
+
+
+class bt_cursor_t;
 class fstr_wrk_thr_t : public smthread_t{
     static ss_m* foster_handle;
 
+    bt_cursor_t* cursor;
 
     base_request_t* req;
 
@@ -81,6 +103,12 @@ class fstr_wrk_thr_t : public smthread_t{
     w_rc_t add_tuple();
     w_rc_t delete_tuple();
     w_rc_t update_tuple();
+
+
+
+    w_rc_t index_probe();
+    w_rc_t next();
+    w_rc_t position_read();
 
 
 #ifdef HAVE_PSI_INTERFACE
@@ -116,8 +144,10 @@ class fstr_wrk_thr_t : public smthread_t{
 
 
     int extract_key(uchar *key, int key_num, const uchar *record, TABLE* table);
-    
+
     int pack_row(unsigned char *from, TABLE* table, unsigned char* buffer);
+
+    int unpack_row(uchar *record, int row_len, uchar *&to, TABLE* table);
 public:
 
     mysql_mutex_t thread_mutex;

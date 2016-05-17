@@ -150,6 +150,13 @@ int fstr_wrk_thr_t::work_ACTIVE(){
             update_tuple(); break;
         case FOSTER_DELETE_ROW:
             err=delete_tuple(); break;
+            
+        case FOSTER_IDX_READ:
+            err=index_probe(); break;
+        case FOSTER_IDX_NEXT:
+            err=next(); break;
+        case FOSTER_POS_READ:
+            err=position_read(); break;
         default: break;
     }
     if(err.is_error()) {
@@ -404,4 +411,86 @@ w_rc_t fstr_wrk_thr_t::delete_tuple(){
 
     W_COERCE(foster_handle->commit_xct());
     return (rc);
+}
+
+
+
+w_rc_t fstr_wrk_thr_t::index_probe(){
+    read_request_t* r = static_cast<read_request_t*>(req);
+    //Infimum and supremum for use in cursors
+    w_keystr_t infimum, supremum;
+    infimum.construct_posinfkey();
+    supremum.construct_neginfkey();
+    // Build key data
+    w_keystr_t kstr;
+    w_keystr_t curr_key;
+    //Construct key of tuple in _key_b
+    if(r->ksz!=0){
+        kstr.construct_regularkey(r->key_buf, r->ksz);
+    }else{
+        r->find_flag==HA_READ_PREFIX_LAST ? kstr.construct_posinfkey() : kstr.construct_neginfkey();
+    }
+    StoreID pkstid = load_stid(r->table_name, r->table->key_info[r->idx_no].name, r->table->key_info[r->idx_no].name_length);
+    //Switch on search modes
+    switch (r->find_flag) {
+        // a<= key
+        case HA_READ_KEY_OR_NEXT:
+            cursor = new bt_cursor_t(pkstid, kstr, true, infimum, false, true);
+            W_COERCE(cursor->next());
+            if (cursor->eof()) {
+                return RC(se_TUPLE_NOT_FOUND);
+            }
+            break;
+        case HA_READ_KEY_OR_PREV:
+            cursor = new bt_cursor_t(pkstid, supremum, true, kstr, false,false);
+            W_COERCE(cursor->next());
+            if (cursor->eof()) {
+                return RC(se_TUPLE_NOT_FOUND);
+            }
+            break;
+        case HA_READ_KEY_EXACT: {
+            cursor = new bt_cursor_t(pkstid, kstr, true, infimum, false, true);
+            W_COERCE(cursor->next());
+            curr_key = cursor->key();
+            int comp = kstr.compare(curr_key);
+            if (comp != 0) return RC(se_TUPLE_NOT_FOUND);
+        }
+            break;
+        case HA_READ_AFTER_KEY:
+            cursor = new bt_cursor_t(pkstid,kstr, false, infimum, false,true);
+            do {
+                W_COERCE(cursor->next());
+                if (cursor->eof()) {
+                    return RC(se_TUPLE_NOT_FOUND);
+                }
+                curr_key= cursor->key();
+            }while(kstr.compare(curr_key));
+            break;
+            //a<key
+        case HA_READ_BEFORE_KEY:
+            cursor = new bt_cursor_t(pkstid,supremum, false,kstr, false,false);
+            do {
+                W_COERCE(cursor->next());
+                if (cursor->eof()) {
+                    return RC(se_TUPLE_NOT_FOUND);
+                }
+                curr_key= cursor->key();
+            }while(kstr.compare(curr_key));
+            break;
+        default: return (RCOK) ;
+    } 
+    unpack_row((uchar *) cursor->elem(), cursor->elen(), r->mysql_format_buf, r->table);
+    return (RCOK);
+
+}
+
+w_rc_t fstr_wrk_thr_t::next(){
+    read_request_t* r = static_cast<read_request_t*>(req);
+    W_COERCE(cursor->next());
+    if (!cursor->eof()) {
+        unpack_row((uchar *) cursor->elem(), cursor->elen(), r->mysql_format_buf, r->table);
+        return RCOK;
+    } else {
+        return RC(se_TUPLE_NOT_FOUND);
+    }
 }
