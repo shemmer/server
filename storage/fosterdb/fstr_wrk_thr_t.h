@@ -90,6 +90,8 @@ class fstr_wrk_thr_t : public smthread_t{
     bt_cursor_t* cursor;
 
     base_request_t* req;
+    
+    uint sec_idx_offset;
 
     w_rc_t startup();
     w_rc_t shutdown();
@@ -141,13 +143,14 @@ class fstr_wrk_thr_t : public smthread_t{
 
     bool _begin_tx;
 
-
-
     int extract_key(uchar *key, int key_num, const uchar *record, TABLE* table);
 
     int pack_row(unsigned char *from, TABLE* table, unsigned char* buffer);
 
     int unpack_row(uchar *record, int row_len, uchar *&to, TABLE* table);
+
+    int add_to_secondary_idx(StoreID sec_id, w_keystr_t secondary, w_keystr_t primary);
+    int delete_from_secondary_idx(StoreID sec_id, w_keystr_t sec_kstr, w_keystr_t primary);
 public:
 
     mysql_mutex_t thread_mutex;

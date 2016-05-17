@@ -150,7 +150,6 @@ int fstr_wrk_thr_t::work_ACTIVE(){
             update_tuple(); break;
         case FOSTER_DELETE_ROW:
             err=delete_tuple(); break;
-            
         case FOSTER_IDX_READ:
             err=index_probe(); break;
         case FOSTER_IDX_NEXT:
@@ -363,6 +362,18 @@ w_rc_t fstr_wrk_thr_t::add_tuple(){
     rc=foster_handle->create_assoc(idx_stid, kstr, vec_t(r->rec_buf, rec_buf_len));
     if(rc.is_error()) { return rc;}
 
+     if(r->table->s->keys>1){
+        uchar* sec_key_buffer = (uchar *) my_malloc(r->max_key_len, MYF(MY_WME));
+        for (int idx = 1; idx < r->table->s->keys; idx++) {
+            StoreID sec_idx_stid =
+                    load_stid(r->table_name, r->table->key_info[idx].name, r->table->key_info[idx].name_length);
+            int sec_ksz = extract_key(sec_key_buffer, idx, r->mysql_format_buf, r->table);
+            w_keystr_t sec_kstr;
+            sec_kstr.construct_regularkey(sec_key_buffer, sec_ksz);
+            add_to_secondary_idx(sec_idx_stid,sec_kstr,kstr);
+        }
+    }
+
     W_COERCE(foster_handle->commit_xct());
     return (rc);
 }
@@ -391,6 +402,28 @@ w_rc_t fstr_wrk_thr_t::update_tuple(){
         changed_pk=true;
     }
 
+    if(r->table->s->keys>1){
+        uchar* sec_key_buffer = (uchar *) my_malloc(r->max_key_len, MYF(MY_WME));
+        uchar* old_sec_key_buffer;
+        for (int idx = 1; idx < r->table->s->keys; idx++) {
+            StoreID sec_idx_stid =
+                    load_stid(r->table_name, r->table->key_info[idx].name, r->table->key_info[idx].name_length);
+
+            int sec_ksz = extract_key(sec_key_buffer, idx, r->mysql_format_buf, r->table);
+
+            w_keystr_t sec_kstr, old_sec_kstr;
+
+            old_sec_key_buffer = (uchar*) my_malloc(r->table->s->key_info[idx].key_part->length, MYF(MY_WME));
+            uint key_offset= r->table->s->key_info[0].key_part->offset;
+            memcpy(old_key_buffer, r->old_mysql_format_buf+key_offset, r->table->s->key_info[0].key_part->length);
+            old_sec_kstr.construct_regularkey(old_sec_key_buffer, r->table->s->key_info[idx].key_part->length);
+            sec_kstr.construct_regularkey(sec_key_buffer, sec_ksz);
+            add_to_secondary_idx(sec_idx_stid,sec_kstr,new_kstr);
+            if(changed_pk) delete_from_secondary_idx(sec_idx_stid,sec_kstr, old_kstr);
+        }
+    }
+
+
     W_COERCE(foster_handle->commit_xct());
     return RCOK;
 }
@@ -408,7 +441,17 @@ w_rc_t fstr_wrk_thr_t::delete_tuple(){
     if(pk_stid==NULL) return RC(eNOTFOUND);
     //create assoc in primary index
     rc=ss_m::destroy_assoc(pk_stid,kstr);
-
+    if(r->table->s->keys>1){
+        uchar* sec_key_buffer = (uchar *) my_malloc(r->max_key_len, MYF(MY_WME));
+        for (int idx = 1; idx < r->table->s->keys; idx++) {
+            StoreID sec_idx_stid =
+                    load_stid(r->table_name, r->table->key_info[idx].name, r->table->key_info[idx].name_length);
+            int sec_ksz = extract_key(sec_key_buffer, idx, r->mysql_format_buf, r->table);
+            w_keystr_t sec_kstr;
+            sec_kstr.construct_regularkey(sec_key_buffer, sec_ksz);
+            delete_from_secondary_idx(sec_idx_stid,sec_kstr, kstr);
+        }
+    }
     W_COERCE(foster_handle->commit_xct());
     return (rc);
 }
@@ -479,18 +522,214 @@ w_rc_t fstr_wrk_thr_t::index_probe(){
             break;
         default: return (RCOK) ;
     } 
-    unpack_row((uchar *) cursor->elem(), cursor->elen(), r->mysql_format_buf, r->table);
+    if(r->idx_no==0) {
+        unpack_row((uchar *) cursor->elem(), cursor->elen(), r->mysql_format_buf, r->table);
+    }else{
+        bool found;
+        uint pksz = r->table->key_info[0].key_length;
+        sec_idx_offset=pksz;
+        uchar* tmp_pk_buffer = (uchar*) my_malloc((size_t) pksz, MYF(MY_WME));
+        for(int i=0; i<pksz; i++){
+            tmp_pk_buffer[i] = (uchar) cursor->elem()[i];
+        }
+        w_keystr_t kstr;
+        kstr.construct_regularkey(tmp_pk_buffer, pksz);
+        smsize_t size=1;
+        uchar* buf= (uchar*) my_malloc(size, MYF(MY_WME));
+        StoreID pk_stid = load_stid(r->table_name, r->table->key_info[0].name, r->table->key_info[0].name_length);
+        w_rc_t rc = foster_handle->find_assoc(pk_stid,kstr, buf, size, found);
+        if(rc.is_error() && rc.err_num()==eRECWONTFIT){
+            buf= (uchar*) my_realloc(buf, size, MYF(MY_WME));
+            foster_handle->find_assoc(pk_stid, kstr, buf, size,found);
+        }
+        unpack_row(buf, size, r->mysql_format_buf, r->table);
+    }
     return (RCOK);
 
 }
 
 w_rc_t fstr_wrk_thr_t::next(){
     read_request_t* r = static_cast<read_request_t*>(req);
-    W_COERCE(cursor->next());
-    if (!cursor->eof()) {
-        unpack_row((uchar *) cursor->elem(), cursor->elen(), r->mysql_format_buf, r->table);
-        return RCOK;
-    } else {
-        return RC(se_TUPLE_NOT_FOUND);
+    if(r->idx_no!=0){
+        if(sec_idx_offset<cursor->elen()){
+            bool found;
+            uint pksz = r->table->key_info[0].key_length;
+            uchar* tmp_pk_buffer = (uchar*) my_malloc((size_t) pksz, MYF(MY_WME));
+            for(int i=0; i<pksz; i++){
+                tmp_pk_buffer[i] = (uchar) cursor->elem()[sec_idx_offset+i];
+            }
+            w_keystr_t kstr;
+            kstr.construct_regularkey(tmp_pk_buffer, pksz);
+            smsize_t size=1;
+            uchar* buf= (uchar*) my_malloc(size, MYF(MY_WME));
+            StoreID pk_stid = load_stid(r->table_name, r->table->key_info[0].name, r->table->key_info[0].name_length);
+            w_rc_t rc = foster_handle->find_assoc(pk_stid,kstr, buf, size, found);
+            if(rc.is_error() && rc.err_num()==eRECWONTFIT){
+                buf= (uchar*) my_realloc(buf, size, MYF(MY_WME));
+                foster_handle->find_assoc(pk_stid, kstr, buf, size,found);
+            }
+            unpack_row(buf, size, r->mysql_format_buf, r->table);
+
+            sec_idx_offset+=pksz;
+
+            return RCOK;
+        }else{
+            W_COERCE(cursor->next());
+            if(!cursor->eof()) {
+                bool found;
+                uint pksz = r->table->key_info[0].key_length;
+                sec_idx_offset = pksz;
+                uchar *tmp_pk_buffer = (uchar *) my_malloc((size_t) pksz, MYF(MY_WME));
+                for (int i = 0; i < pksz; i++) {
+                    tmp_pk_buffer[i] = (uchar) cursor->elem()[i];
+                }
+                w_keystr_t kstr;
+                kstr.construct_regularkey(tmp_pk_buffer, pksz);
+                smsize_t size = 1;
+                uchar *buf = (uchar *) my_malloc(size, MYF(MY_WME));
+                StoreID pk_stid = load_stid(r->table_name, r->table->key_info[0].name,
+                                            r->table->key_info[0].name_length);
+                w_rc_t rc = foster_handle->find_assoc(pk_stid, kstr, buf, size, found);
+                if (rc.is_error() && rc.err_num() == eRECWONTFIT) {
+                    buf = (uchar *) my_realloc(buf, size, MYF(MY_WME));
+                    foster_handle->find_assoc(pk_stid, kstr, buf, size, found);
+                }
+                unpack_row(buf, size, r->mysql_format_buf, r->table);
+                return RCOK;
+            }else{
+                return RC(se_TUPLE_NOT_FOUND);
+            }
+        }
+    }else {
+        W_COERCE(cursor->next());
+        if (!cursor->eof()) {
+            unpack_row((uchar *) cursor->elem(), cursor->elen(), r->mysql_format_buf, r->table);
+            return RCOK;
+        } else {
+            return RC(se_TUPLE_NOT_FOUND);
+        }
     }
+}
+
+
+
+w_rc_t fstr_wrk_thr_t::position_read(){
+    read_request_t* r = static_cast<read_request_t*>(req);
+    bool found;
+    w_rc_t rc;
+    w_keystr_t kstr;
+    kstr.construct_regularkey(r->key_buf, r->ksz);
+    uchar* record_buf;
+    smsize_t size=1;
+    StoreID pk_stid = load_stid(r->table_name, r->table->key_info[0].name, r->table->key_info[0].name_length);
+    record_buf= (uchar*) my_malloc(size, MYF(MY_WME));
+       rc = foster_handle->find_assoc(pk_stid,kstr,record_buf,size, found);
+        if(rc.is_error() && rc.err_num()==eRECWONTFIT){
+            record_buf = (uchar *) my_realloc(record_buf, size, MYF(MY_WME));
+            rc = foster_handle->find_assoc(pk_stid,kstr,record_buf,size, found);
+        }
+    return rc;
+}
+
+
+
+int fstr_wrk_thr_t::add_to_secondary_idx(StoreID sec_id, w_keystr_t sec_kstr, w_keystr_t primary){
+    w_rc_t rc;
+    bool found;
+    //Length of a key in bytes
+    int pksz=primary.get_length_as_nonkeystr();
+    w_rc_t sec_rc = foster_handle->create_assoc(sec_id, sec_kstr, vec_t(primary.serialize_as_nonkeystr().data(), pksz));
+    if(sec_rc.is_error() && sec_rc.err_num()==eDUPLICATE){
+        uchar* old_buf;
+        smsize_t len = (smsize_t) pksz;
+        //ksz = size of primary keys
+        //Get pks already under the secondary idx with the same sec_key
+        old_buf= (uchar*)my_malloc((size_t) pksz, MYF(MY_WME));
+        rc = foster_handle->find_assoc(sec_id, sec_kstr, old_buf, len, found);
+        if(rc.is_error() && rc.err_num()==eRECWONTFIT) {
+            old_buf = (uchar *) my_realloc(old_buf, len, MYF(MY_WME));
+            W_COERCE(foster_handle->find_assoc(sec_id, sec_kstr, old_buf, len, found));
+        }
+
+        uchar* tmp_pk_buffer = (uchar*) my_malloc((size_t) pksz, MYF(MY_WME));
+        uchar* new_buffer = (uchar*) my_malloc(len+pksz, MYF(MY_WME));
+
+        w_keystr_t compare_key;
+
+        bool done=false;
+        for(int i=0; i<len;i+=pksz){
+            for(int j=0; j<pksz; j++) {
+                tmp_pk_buffer[j] = old_buf[i + j];
+            }
+            compare_key.construct_regularkey(tmp_pk_buffer, pksz);
+
+            if(compare_key.compare(primary)>0){
+                for(int k=0; k<i; k++){
+                    new_buffer[k]=old_buf[k];
+                }
+                for(int k=0; k<pksz; k++){
+                    new_buffer[i+k]=primary.serialize_as_nonkeystr().data()[k];
+                }
+                for(int k=0; k<len-i; k++){
+                    new_buffer[i+pksz+k]= old_buf[i+k];
+                }
+                done=true;
+                break;
+            }
+        }
+        my_free(tmp_pk_buffer);
+        if(!done){
+            int i;
+            for(i=0; i< len; i++){
+                new_buffer[i]=old_buf[i];
+            }
+            for(int j=0; j< pksz;j++){
+                new_buffer[i+j]=primary.serialize_as_nonkeystr().data()[j];
+            }
+        }
+        foster_handle->put_assoc(sec_id,sec_kstr,vec_t(new_buffer, len+pksz));
+        my_free(new_buffer);
+        my_free(old_buf);
+    }
+}
+
+int fstr_wrk_thr_t::delete_from_secondary_idx(StoreID sec_id, w_keystr_t sec_kstr, w_keystr_t primary){
+    w_rc_t rc;
+    bool found;
+    int pksz=primary.get_length_as_nonkeystr();
+
+    uchar* old_buf;
+    smsize_t len;
+    //ksz = size of primary keys
+    //Get pks already under the secondary idx with the same sec_key
+    old_buf= (uchar*)my_malloc((size_t) pksz, MYF(MY_WME));
+    rc = foster_handle->find_assoc(sec_id, sec_kstr, old_buf, len, found);
+    if(rc.is_error() && rc.err_num()==eRECWONTFIT) {
+        old_buf = (uchar *) my_realloc(old_buf, len, MYF(MY_WME));
+        rc = foster_handle->find_assoc(sec_id, sec_kstr, old_buf, len, found);
+    }
+
+    uchar* tmp_pk_buffer = (uchar*) my_malloc((size_t) pksz, MYF(MY_WME));
+    uchar* new_buffer = (uchar*) my_malloc(len-pksz, MYF(MY_WME));
+    //0 if equal. <0 if this<r, >0 if this>r
+    w_keystr_t compare_key;
+    for(int i=0; i<len;i+=pksz){
+        //Create a temporary buffer by extracting
+        for(int j=0; j<pksz; j++) {
+            tmp_pk_buffer[j] = old_buf[i + j];
+        }
+        compare_key.construct_regularkey(tmp_pk_buffer, pksz);
+        if(compare_key.compare(primary)==0){
+            for(int k=0; k<i; k++){
+                new_buffer[k]=old_buf[k];
+            }
+            for(int k=i; k<len-pksz; k++){
+                new_buffer[k]= old_buf[k+pksz];
+            }
+            break;
+        }
+    }
+    my_free(tmp_pk_buffer);
+    foster_handle->put_assoc(sec_id,sec_kstr,vec_t(new_buffer, len-pksz));
+
 }
