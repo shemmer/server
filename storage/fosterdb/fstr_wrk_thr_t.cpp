@@ -156,6 +156,10 @@ int fstr_wrk_thr_t::work_ACTIVE(){
             err=next(); break;
         case FOSTER_POS_READ:
             err=position_read(); break;
+        case FOSTER_COMMIT:
+            foster_commit(); break;
+        case FOSTER_ROLLBACK:
+            err=foster_rollback();break;
         default: break;
     }
     if(err.is_error()) {
@@ -373,8 +377,6 @@ w_rc_t fstr_wrk_thr_t::add_tuple(){
             add_to_secondary_idx(sec_idx_stid,sec_kstr,kstr);
         }
     }
-
-    W_COERCE(foster_handle->commit_xct());
     return (rc);
 }
 
@@ -422,9 +424,6 @@ w_rc_t fstr_wrk_thr_t::update_tuple(){
             if(changed_pk) delete_from_secondary_idx(sec_idx_stid,sec_kstr, old_kstr);
         }
     }
-
-
-    W_COERCE(foster_handle->commit_xct());
     return RCOK;
 }
 
@@ -452,7 +451,6 @@ w_rc_t fstr_wrk_thr_t::delete_tuple(){
             delete_from_secondary_idx(sec_idx_stid,sec_kstr, kstr);
         }
     }
-    W_COERCE(foster_handle->commit_xct());
     return (rc);
 }
 
@@ -732,4 +730,16 @@ int fstr_wrk_thr_t::delete_from_secondary_idx(StoreID sec_id, w_keystr_t sec_kst
     my_free(tmp_pk_buffer);
     foster_handle->put_assoc(sec_id,sec_kstr,vec_t(new_buffer, len-pksz));
 
+}
+
+
+w_rc_t fstr_wrk_thr_t::foster_commit(){
+    W_COERCE(foster_handle->commit_xct());
+    return RCOK;
+}
+
+
+w_rc_t fstr_wrk_thr_t::foster_rollback(){
+    W_COERCE(foster_handle->abort_xct());
+    return RCOK;
 }

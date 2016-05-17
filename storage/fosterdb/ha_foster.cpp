@@ -79,7 +79,51 @@ static uchar* foster_get_key(FOSTER_SHARE *share, size_t *length,
   *length=share->table_name_length;
   return (uchar*) share->table_name;
 }
+static int fstr_commit(handlerton *hton, THD *thd, bool all){
+  DBUG_ENTER("foster_commit_func");
+  bool multi_stmt = (bool) thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
+  if(multi_stmt || all) {
+    fstr_wrk_thr_t *worker = (fstr_wrk_thr_t *) thd_get_ha_data(thd, hton);
+    base_request_t *req = new base_request_t();
+    //Locking work request mutex
+    mysql_mutex_init(key_mutex_foster_wrk, &req->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
+    mysql_mutex_lock(&req->LOCK_work_mutex);
+    //Init the request condition -> used to signal the handler when the worker is done
+    mysql_cond_init(key_COND_work, &req->COND_work, NULL);
 
+    req->type = FOSTER_COMMIT;
+    worker->set_request(req);
+    worker->notify(true);
+
+    mysql_mutex_lock(&worker->thread_mutex);
+    worker->set_request(req);
+    worker->notify(true);
+    mysql_cond_signal(&worker->COND_worker);
+    mysql_mutex_unlock(&worker->thread_mutex);
+    while (!req->notified) {
+      mysql_cond_wait(&req->COND_work, &req->LOCK_work_mutex);
+    }
+    mysql_mutex_unlock(&req->LOCK_work_mutex);
+
+    mysql_mutex_destroy(&req->LOCK_work_mutex);
+    delete (req);
+    thd_set_ha_data(thd, hton, nullptr);
+    worker->foster_exit();
+    delete (worker);
+    DBUG_RETURN(0);
+  }else{
+    //end of a statement
+  }
+  DBUG_RETURN(0);
+}
+static int fstr_rollback(handlerton *hton, THD *thd, bool all){
+  DBUG_ENTER("foster_rollback_func");
+  DBUG_RETURN(0);
+}
+static int fstr_prepare(handlerton *hton, THD *thd, bool all){
+  DBUG_ENTER("foster_prepare_func");
+  DBUG_RETURN(0);
+}
 static int foster_init_func(void *p)
 {
   DBUG_ENTER("foster_init_func");
@@ -99,6 +143,9 @@ static int foster_init_func(void *p)
   foster_hton->create=  foster_create_handler;
   foster_hton->flags=   HTON_NO_FLAGS;
   foster_hton->tablefile_extensions= ha_foster_exts;
+  foster_hton->commit=fstr_commit;
+  foster_hton->rollback=fstr_rollback;
+  foster_hton->prepare=fstr_prepare;
 
 
     start_stop_request_t* req = new start_stop_request_t();
@@ -242,6 +289,8 @@ static handler* foster_create_handler(handlerton *hton,
 {
   return new (mem_root) ha_foster(hton, table);
 }
+
+
 
 ha_foster::ha_foster(handlerton *hton, TABLE_SHARE *table_arg)
         :handler(hton, table_arg)

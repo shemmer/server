@@ -27,6 +27,8 @@ const int FOSTER_IDX_READ = 15;
 const int FOSTER_IDX_NEXT = 16;
 const int FOSTER_POS_READ = 18;
 
+const int FOSTER_COMMIT =20;
+const int FOSTER_ROLLBACK=21;
 
 struct base_request_t{
     mysql_cond_t COND_work;
@@ -90,7 +92,7 @@ class fstr_wrk_thr_t : public smthread_t{
     bt_cursor_t* cursor;
 
     base_request_t* req;
-    
+
     uint sec_idx_offset;
 
     w_rc_t startup();
@@ -101,16 +103,16 @@ class fstr_wrk_thr_t : public smthread_t{
     w_rc_t create_physical_table();
     w_rc_t delete_table();
 
-
     w_rc_t add_tuple();
     w_rc_t delete_tuple();
     w_rc_t update_tuple();
 
-
-
     w_rc_t index_probe();
     w_rc_t next();
     w_rc_t position_read();
+
+    w_rc_t foster_commit();
+    w_rc_t foster_rollback();
 
 
 #ifdef HAVE_PSI_INTERFACE
