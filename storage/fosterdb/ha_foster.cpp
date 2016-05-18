@@ -301,6 +301,33 @@ ha_foster::ha_foster(handlerton *hton, TABLE_SHARE *table_arg)
 int ha_foster::open(const char *name, int mode, uint test_if_locked)
 {
   DBUG_ENTER("ha_foster::open");
+
+  if (!(share= get_share(name)))
+    DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+
+  table_name = name;
+  ref_length = table->key_info[0].key_length;
+
+  for(uint i=1; i<table->s->keys; i++) {
+    if (max_key_len < table->key_info[i].key_length)
+      max_key_len = table->key_info[i].key_length;
+  }
+
+
+  for(uint i=1; i<table->s->keys; i++) {
+    if (max_key_name_len < table->key_info[i].name_length)
+      max_key_len = table->key_info[i].name_length;
+  }
+
+  key_buffer = (uchar*) my_malloc(max_key_len, MYF(MY_WME));
+  if (key_buffer == 0)
+    DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+
+  record_buffer= create_record_buffer(table->s->reclength);
+  if (!record_buffer)
+    DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+
+  thr_lock_data_init(&share->lock,&lock,(void*) this);
   DBUG_RETURN(0);
 }
 
@@ -523,6 +550,7 @@ int ha_foster::delete_row(const uchar *buf)
   DBUG_RETURN(rc);
 }
 int ha_foster::index_init(uint idx, bool sorted){
+  active_index=idx;
   return 0;
 }
 int ha_foster::index_end(){
@@ -535,6 +563,7 @@ int ha_foster::index_read_idx_map(uchar * buf, uint index, const uchar * key,
   DBUG_ENTER("ha_foster::index_read_idx_map");
   read_request_t *req = new read_request_t();
 
+  table->status = 0;
   //Locking work request mutex
   mysql_mutex_init(key_mutex_foster_wrk, &req->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
   mysql_mutex_lock(&req->LOCK_work_mutex);
@@ -583,6 +612,7 @@ int ha_foster::index_read(uchar *buf, const uchar *key, uint key_len,
   DBUG_ENTER("ha_foster::index_read");
   read_request_t *req = new read_request_t();
 
+  table->status = 0;
   //Locking work request mutex
   mysql_mutex_init(key_mutex_foster_wrk, &req->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
   mysql_mutex_lock(&req->LOCK_work_mutex);
@@ -709,7 +739,7 @@ int ha_foster::rnd_init(bool scan)
 
 int ha_foster::rnd_next(uchar *buf)
 {
-  int rc=0;
+  int rc;
   DBUG_ENTER("ha_foster::rnd_next");
 
   table->status = 0;
@@ -777,6 +807,7 @@ int ha_foster::rnd_pos(uchar *buf, uchar *pos)
   DBUG_ENTER("ha_foster::rnd_pos");
   read_request_t *req = new read_request_t();
 
+  table->status = 0;
   //Locking work request mutex
   mysql_mutex_init(key_mutex_foster_wrk, &req->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
   mysql_mutex_lock(&req->LOCK_work_mutex);
@@ -820,6 +851,8 @@ int ha_foster::rnd_pos(uchar *buf, uchar *pos)
 int ha_foster::info(uint flag)
 {
   DBUG_ENTER("ha_foster::info");
+  if (flag & HA_STATUS_VARIABLE)
+    stats.records= 1;
   DBUG_RETURN(0);
 }
 
@@ -843,6 +876,59 @@ int ha_foster::delete_all_rows()
 int ha_foster::external_lock(THD *thd, int lock_type)
 {
   DBUG_ENTER("ha_foster::external_lock");
+  bool multi_stmt= (bool) thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
+  worker = (fstr_wrk_thr_t*) thd_get_ha_data(thd, ht);
+  if (lock_type == F_UNLCK)
+  {
+    worker->numUsedTables--;
+    if (!worker->numUsedTables)
+    {
+      // end of statement
+      if (!multi_stmt) {
+        fstr_wrk_thr_t *worker = (fstr_wrk_thr_t *) thd_get_ha_data(thd, ht);
+        base_request_t *req = new base_request_t();
+        //Locking work request mutex
+        mysql_mutex_init(key_mutex_foster_wrk, &req->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
+        mysql_mutex_lock(&req->LOCK_work_mutex);
+        //Init the request condition -> used to signal the handler when the worker is done
+        mysql_cond_init(key_COND_work, &req->COND_work, NULL);
+
+        req->type = FOSTER_COMMIT;
+        worker->set_request(req);
+        worker->notify(true);
+
+        mysql_mutex_lock(&worker->thread_mutex);
+        worker->set_request(req);
+        worker->notify(true);
+        mysql_cond_signal(&worker->COND_worker);
+        mysql_mutex_unlock(&worker->thread_mutex);
+        while (!req->notified) {
+          mysql_cond_wait(&req->COND_work, &req->LOCK_work_mutex);
+        }
+        mysql_mutex_unlock(&req->LOCK_work_mutex);
+        delete (req);
+        thd_set_ha_data(thd, ht, nullptr);
+        worker->foster_exit();
+        delete (worker);
+      }
+    }
+  }
+  else
+  {
+    if (!worker)
+    {
+      // beginning of new transaction
+      worker = new fstr_wrk_thr_t(true);
+      thd_set_ha_data(thd, ht, worker);
+      trans_register_ha(thd, multi_stmt, ht);
+    }
+
+    if (!worker->numUsedTables)
+    {
+      // beginning of new statement
+    }
+    worker->numUsedTables++;
+  }
   DBUG_RETURN(0);
 }
 
