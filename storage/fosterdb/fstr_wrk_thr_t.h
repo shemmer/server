@@ -41,6 +41,8 @@ struct base_request_t{
 };
 
 struct start_stop_request_t : base_request_t{
+    char* db;
+    char* logdir;
 };
 
 struct ddl_request_t : base_request_t{
@@ -86,6 +88,7 @@ struct read_request_t : base_request_t{
 
 
 class bt_cursor_t;
+class sm_options;
 class fstr_wrk_thr_t : public smthread_t{
     static ss_m* foster_handle;
 
@@ -113,6 +116,8 @@ class fstr_wrk_thr_t : public smthread_t{
 
     w_rc_t foster_commit();
     w_rc_t foster_rollback();
+
+    void foster_config(sm_options* options);
 
 
 #ifdef HAVE_PSI_INTERFACE

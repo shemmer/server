@@ -28,6 +28,9 @@ static int free_share(FOSTER_SHARE *share);
 static HASH foster_open_tables;
 mysql_mutex_t foster_mutex;
 
+static char* fstr_db_var;
+static char* fstr_logdir_var;
+
 static handler *foster_create_handler(handlerton *hton,
                                       TABLE_SHARE *table,
                                       MEM_ROOT *mem_root);
@@ -155,6 +158,8 @@ static int foster_init_func(void *p)
     //Init the request condition -> used to signal the handler when the worker is done
     mysql_cond_init(key_COND_work, &req->COND_work, NULL);
     req->type=FOSTER_STARTUP;
+    req->db=fstr_db_var;
+    req->logdir=fstr_logdir_var;
 
     ha_foster::main_thread = new fstr_wrk_thr_t(false);
     mysql_mutex_lock(&ha_foster::main_thread->thread_mutex);
@@ -1068,12 +1073,29 @@ ha_foster::check_if_supported_inplace_alter(TABLE* altered_table,
 struct st_mysql_storage_engine foster_storage_engine=
         { MYSQL_HANDLERTON_INTERFACE_VERSION };
 
+//#define MYSQL_SYSVAR_STR(name, varname, opt, comment, check, update, def) \/
+static MYSQL_SYSVAR_STR(
+        db,                       // name
+        fstr_db_var,                   // varname
+        PLUGIN_VAR_READONLY,            // opt
+        "Location of the DB file", // comment
+        NULL,                           // check
+        NULL,                           // update
+        "/home/stefan/mariadb/zero_log/db");
+static MYSQL_SYSVAR_STR(
+        logdir,                       // name
+        fstr_logdir_var,                // varname
+        PLUGIN_VAR_READONLY,            // opt
+        "Location of the log directory", // comment
+        NULL,                           // check
+        NULL,                           // update
+        "/home/stefan/mariadb/zero_log/log");
+
 static struct st_mysql_sys_var* foster_system_variables[]= {
+        MYSQL_SYSVAR(db),
+        MYSQL_SYSVAR(logdir),
         NULL
 };
-
-
-
 mysql_declare_plugin(foster)
                 {
                         MYSQL_STORAGE_ENGINE_PLUGIN,

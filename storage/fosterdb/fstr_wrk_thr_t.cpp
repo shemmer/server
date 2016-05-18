@@ -38,19 +38,19 @@ void fstr_wrk_thr_t::foster_exit(){
 }
 
 
-static void foster_config(sm_options* options){
+void fstr_wrk_thr_t::foster_config(sm_options* options){
 
-    string logdir ="/home/stefan/mariadb/zero_log/log";
+    start_stop_request_t *start_req = static_cast<start_stop_request_t *>(req);
+
+    string logdir(start_req->logdir);
+    string opt_dbfile(start_req->db);
+
     string archdir;
-    string opt_dbfile = "/home/stefan/mariadb/zero_log/db";
     string opt_backup;
 
     bool format = false;
 
     string errlog ="/home/stefan/mariadb/zero_log/shoremt.err.log";
-/**
- * REQUIRED
- */
     options->set_bool_option("sm_logging",true);
     options->set_bool_option("sm_archive_eager",false);
 
@@ -185,7 +185,6 @@ w_rc_t fstr_wrk_thr_t::shutdown() {
 
 w_rc_t fstr_wrk_thr_t::startup() {
     DBUG_ENTER("fstr_wrk_thr::startup");
-    start_stop_request_t *start_req = static_cast<start_stop_request_t *>(req);
     sm_options* options = new sm_options();
     foster_config(options);
     foster_handle = new ss_m(*options);
