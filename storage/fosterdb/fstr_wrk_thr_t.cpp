@@ -620,11 +620,12 @@ w_rc_t fstr_wrk_thr_t::position_read(){
     smsize_t size=1;
     StoreID pk_stid = load_stid(r->table_name, r->table->key_info[0].name, r->table->key_info[0].name_length);
     record_buf= (uchar*) my_malloc(size, MYF(MY_WME));
-       rc = foster_handle->find_assoc(pk_stid,kstr,record_buf,size, found);
-        if(rc.is_error() && rc.err_num()==eRECWONTFIT){
-            record_buf = (uchar *) my_realloc(record_buf, size, MYF(MY_WME));
-            rc = foster_handle->find_assoc(pk_stid,kstr,record_buf,size, found);
-        }
+    rc = foster_handle->find_assoc(pk_stid,kstr,record_buf,size, found);
+    if(rc.is_error() && rc.err_num()==eRECWONTFIT){
+        record_buf = (uchar *) my_realloc(record_buf, size, MYF(MY_WME));
+        rc = foster_handle->find_assoc(pk_stid,kstr,record_buf,size, found);
+    }
+    unpack_row(record_buf, size, r->mysql_format_buf, r->table);
     return rc;
 }
 
