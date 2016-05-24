@@ -856,8 +856,6 @@ int ha_foster::rnd_pos(uchar *buf, uchar *pos)
 int ha_foster::info(uint flag)
 {
   DBUG_ENTER("ha_foster::info");
-  if (flag & HA_STATUS_VARIABLE)
-    stats.records= 1;
   DBUG_RETURN(0);
 }
 
@@ -1101,7 +1099,7 @@ mysql_declare_plugin(foster)
                         MYSQL_STORAGE_ENGINE_PLUGIN,
                         &foster_storage_engine,
                         "foster",
-                        "Brian Aker, MySQL AB",
+                        "Stefan Hemmer, TU KL",
                         "foster storage engine",
                         PLUGIN_LICENSE_GPL,
                         foster_init_func,                            /* Plugin Init */
@@ -1118,7 +1116,7 @@ maria_declare_plugin(foster)
                         MYSQL_STORAGE_ENGINE_PLUGIN,
                         &foster_storage_engine,
                         "foster",
-                        "Brian Aker, MySQL AB",
+                        "Stefan Hemmer, TU KL",
                         "foster storage engine",
                         PLUGIN_LICENSE_GPL,
                         foster_init_func,                            /* Plugin Init */

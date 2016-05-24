@@ -365,7 +365,7 @@ w_rc_t fstr_wrk_thr_t::add_tuple(){
     rc=foster_handle->create_assoc(idx_stid, kstr, vec_t(r->rec_buf, rec_buf_len));
     if(rc.is_error()) { return rc;}
 
-     if(r->table->s->keys>1){
+    if(r->table->s->keys>1){
         uchar* sec_key_buffer = (uchar *) my_malloc(r->max_key_len, MYF(MY_WME));
         for (int idx = 1; idx < r->table->s->keys; idx++) {
             StoreID sec_idx_stid =
@@ -463,62 +463,64 @@ w_rc_t fstr_wrk_thr_t::index_probe(){
     supremum.construct_neginfkey();
     // Build key data
     w_keystr_t kstr;
-    w_keystr_t curr_key;
+
+    bool partial =false;
     //Construct key of tuple in _key_b
     if(r->ksz!=0){
         kstr.construct_regularkey(r->key_buf, r->ksz);
+        if(r->ksz <r->table->key_info[r->idx_no].key_length) {
+            partial = true;
+            //Null bit set
+            if (r->key_buf[0] != 0) kstr.construct_neginfkey();
+        }
     }else{
         r->find_flag==HA_READ_PREFIX_LAST ? kstr.construct_posinfkey() : kstr.construct_neginfkey();
     }
-    StoreID pkstid = load_stid(r->table_name, r->table->key_info[r->idx_no].name, r->table->key_info[r->idx_no].name_length);
+
+    StoreID idx_stid = load_stid(r->table_name, r->table->key_info[r->idx_no].name, r->table->key_info[r->idx_no].name_length);
     //Switch on search modes
     switch (r->find_flag) {
-        // a<= key
         case HA_READ_KEY_OR_NEXT:
-            cursor = new bt_cursor_t(pkstid, kstr, true, infimum, false, true);
+            cursor = new bt_cursor_t(idx_stid, kstr, true, infimum, false, true);
             W_COERCE(cursor->next());
             if (cursor->eof()) {
                 return RC(se_TUPLE_NOT_FOUND);
             }
             break;
         case HA_READ_KEY_OR_PREV:
-            cursor = new bt_cursor_t(pkstid, supremum, true, kstr, false,false);
+            cursor = new bt_cursor_t(idx_stid, supremum, true, kstr, false, false);
             W_COERCE(cursor->next());
             if (cursor->eof()) {
                 return RC(se_TUPLE_NOT_FOUND);
             }
             break;
         case HA_READ_KEY_EXACT: {
-            cursor = new bt_cursor_t(pkstid, kstr, true, infimum, false, true);
+            cursor = new bt_cursor_t(idx_stid, kstr, true, infimum, false, true);
             W_COERCE(cursor->next());
-            curr_key = cursor->key();
-            int comp = kstr.compare(curr_key);
-            if (comp != 0) return RC(se_TUPLE_NOT_FOUND);
+            int comp = kstr.compare(cursor->key());
+            if (comp < 0) {
+                if(!partial) return RC(se_TUPLE_NOT_FOUND);
+            }
         }
             break;
         case HA_READ_AFTER_KEY:
-            cursor = new bt_cursor_t(pkstid,kstr, false, infimum, false,true);
-            do {
-                W_COERCE(cursor->next());
-                if (cursor->eof()) {
-                    return RC(se_TUPLE_NOT_FOUND);
-                }
-                curr_key= cursor->key();
-            }while(kstr.compare(curr_key));
+            cursor = new bt_cursor_t(idx_stid, kstr, false, infimum, false, true);
+            W_COERCE(cursor->next());
+            if (cursor->eof()) {
+                return RC(se_TUPLE_NOT_FOUND);
+            }
             break;
-            //a<key
         case HA_READ_BEFORE_KEY:
-            cursor = new bt_cursor_t(pkstid,supremum, false,kstr, false,false);
-            do {
-                W_COERCE(cursor->next());
-                if (cursor->eof()) {
-                    return RC(se_TUPLE_NOT_FOUND);
-                }
-                curr_key= cursor->key();
-            }while(kstr.compare(curr_key));
+            cursor = new bt_cursor_t(idx_stid, supremum, false, kstr, false, false);
+            W_COERCE(cursor->next());
+            if (cursor->eof()) {
+                return RC(se_TUPLE_NOT_FOUND);
+            }
             break;
-        default: return (RCOK) ;
-    } 
+        default:
+            return (RCOK);
+    }
+
     if(r->idx_no==0) {
         unpack_row((uchar *) cursor->elem(), cursor->elen(), r->mysql_format_buf, r->table);
     }else{

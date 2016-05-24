@@ -84,20 +84,19 @@ public:
     {
         return HA_TABLE_SCAN_ON_INDEX |
                HA_NULL_IN_KEY |
-               //               HA_CAN_SQL_HANDLER |
-               //               HA_REQUIRES_KEY_COLUMNS_FOR_DELETE |
-               //               HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |
-               //               HA_PRIMARY_KEY_REQUIRED_FOR_DELETE |
+               HA_CAN_SQL_HANDLER |
+               HA_REQUIRES_KEY_COLUMNS_FOR_DELETE |
+               HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |
+               HA_PRIMARY_KEY_REQUIRED_FOR_DELETE |
                HA_REQUIRE_PRIMARY_KEY |
                HA_PRIMARY_KEY_IN_READ_INDEX|
                HA_REC_NOT_IN_SEQ |
                HA_AUTO_PART_KEY |
                HA_CAN_INDEX_BLOBS |
-               HA_STATS_RECORDS_IS_EXACT
-//               HA_NO_PREFIX_CHAR_KEYS|
-//               HA_NO_AUTO_INCREMENT|
-//               HA_ANY_INDEX_MAY_BE_UNIQUE|
-//               HA_HAS_OWN_BINLOGGING
+               HA_NO_PREFIX_CHAR_KEYS|
+               HA_NO_AUTO_INCREMENT|
+               HA_ANY_INDEX_MAY_BE_UNIQUE|
+               HA_HAS_OWN_BINLOGGING
                 ;
     }
 
