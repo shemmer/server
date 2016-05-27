@@ -140,6 +140,8 @@ int fstr_wrk_thr_t::work_ACTIVE(){
             err=startup();break;
         case FOSTER_SHUTDOWN:
             err=shutdown();break;
+            case FOSTER_DISCOVERY:
+            err=discover_table(); break;
         case FOSTER_CREATE:
             err=create_physical_table();break;
         case FOSTER_DELETE:
@@ -208,35 +210,18 @@ w_rc_t fstr_wrk_thr_t::startup() {
 }
 
 
-StoreID load_stid(String name, char* key_name, size_t key_name_length)
+
+w_rc_t fstr_wrk_thr_t::discover_table()
 {
-    uchar separator[4]={"###"};
-
-    size_t idx_name_buf_len = (size_t) name.length() +key_name_length+3;
-    uchar* idx_name_buf= (uchar*)malloc(idx_name_buf_len);
-
-    memcpy(idx_name_buf, name.ptr(), name.length());
-    idx_name_buf += name.length();
-
-    memcpy(idx_name_buf, separator, 3);
-    idx_name_buf+=3;
-
-    memcpy(idx_name_buf, key_name,  key_name_length);
-    idx_name_buf -= (name.length()+3);
+    discovery_request_t* r = static_cast<discovery_request_t*>(req);
     w_keystr_t kstr;
-    kstr.construct_regularkey(idx_name_buf, idx_name_buf_len);
+    kstr.construct_regularkey(r->idx_name_buf, r->idx_name_buf_len);
     StoreID stid;
     StoreID cat_stid =1;
     smsize_t size = sizeof(StoreID);
     bool found;
-    w_rc_t err = ss_m::find_assoc(cat_stid, kstr, &stid, size, found);
-    if(err.is_error()){
-        return NULL;
-    }
-    if (!found) {
-        return NULL;
-    }
-    return stid;
+    W_COERCE(ss_m::find_assoc(cat_stid, kstr, &stid, size, found));
+    r->stid=&stid;
 }
 
 /**
@@ -358,18 +343,16 @@ w_rc_t fstr_wrk_thr_t::add_tuple(){
     int ksz = extract_key(r->key_buf, 0, r->mysql_format_buf, r->table);
     kstr.construct_regularkey(r->key_buf, ksz);
     //Load stid of the primary idx
-    StoreID idx_stid = load_stid(r->table_name, r->table->key_info[0].name, r->table->key_info[0].name_length);
-    if(idx_stid==NULL) return RC(eNOTFOUND);
+    StoreID pkstid = r->stids.at(0);
     uint rec_buf_len =(uint) pack_row(r->mysql_format_buf, r->table, r->rec_buf);
     //create assoc in primary index
-    rc=foster_handle->create_assoc(idx_stid, kstr, vec_t(r->rec_buf, rec_buf_len));
+    rc=foster_handle->create_assoc(pkstid, kstr, vec_t(r->rec_buf, rec_buf_len));
     if(rc.is_error()) { return rc;}
 
-    if(r->table->s->keys>1){
+    if(r->stids.size()>1){
         uchar* sec_key_buffer = (uchar *) my_malloc(r->max_key_len, MYF(MY_WME));
-        for (int idx = 1; idx < r->table->s->keys; idx++) {
-            StoreID sec_idx_stid =
-                    load_stid(r->table_name, r->table->key_info[idx].name, r->table->key_info[idx].name_length);
+        for (int idx = 1; idx < r->stids.size(); idx++) {
+            StoreID sec_idx_stid = r->stids.at(idx);
             int sec_ksz = extract_key(sec_key_buffer, idx, r->mysql_format_buf, r->table);
             w_keystr_t sec_kstr;
             sec_kstr.construct_regularkey(sec_key_buffer, sec_ksz);
@@ -382,7 +365,7 @@ w_rc_t fstr_wrk_thr_t::add_tuple(){
 w_rc_t fstr_wrk_thr_t::update_tuple(){
     bool changed_pk=false;
     write_request_t* r = static_cast<write_request_t*>(req);
-    StoreID pk_stid = load_stid(r->table_name, r->table->key_info[0].name, r->table->key_info[0].name_length);
+    StoreID pk_stid = r->stids.at(0);
     w_keystr_t new_kstr;
     int ksz = extract_key(r->key_buf, 0, r->mysql_format_buf, r->table);
     new_kstr.construct_regularkey(r->key_buf, ksz);
@@ -403,12 +386,11 @@ w_rc_t fstr_wrk_thr_t::update_tuple(){
         changed_pk=true;
     }
 
-    if(r->table->s->keys>1){
+    if(r->stids.size()>1){
         uchar* sec_key_buffer = (uchar *) my_malloc(r->max_key_len, MYF(MY_WME));
         uchar* old_sec_key_buffer;
-        for (int idx = 1; idx < r->table->s->keys; idx++) {
-            StoreID sec_idx_stid =
-                    load_stid(r->table_name, r->table->key_info[idx].name, r->table->key_info[idx].name_length);
+        for (int idx = 1; idx < r->stids.size(); idx++) {
+            StoreID sec_idx_stid = r->stids.at(idx);
 
             int sec_ksz = extract_key(sec_key_buffer, idx, r->mysql_format_buf, r->table);
 
@@ -435,15 +417,13 @@ w_rc_t fstr_wrk_thr_t::delete_tuple(){
     int ksz = extract_key(r->key_buf, 0, r->mysql_format_buf, r->table);
     kstr.construct_regularkey(r->key_buf, ksz);
     //Load stid of the primary idx
-    StoreID pk_stid = load_stid(r->table_name, r->table->key_info[0].name, r->table->key_info[0].name_length);
-    if(pk_stid==NULL) return RC(eNOTFOUND);
+    StoreID pk_stid = r->stids.at(0);
     //create assoc in primary index
     rc=ss_m::destroy_assoc(pk_stid,kstr);
-    if(r->table->s->keys>1){
+    if(r->stids.size()>1){
         uchar* sec_key_buffer = (uchar *) my_malloc(r->max_key_len, MYF(MY_WME));
-        for (int idx = 1; idx < r->table->s->keys; idx++) {
-            StoreID sec_idx_stid =
-                    load_stid(r->table_name, r->table->key_info[idx].name, r->table->key_info[idx].name_length);
+        for (int idx = 1; idx < r->stids.size(); idx++) {
+            StoreID sec_idx_stid = r->stids.at(idx);
             int sec_ksz = extract_key(sec_key_buffer, idx, r->mysql_format_buf, r->table);
             w_keystr_t sec_kstr;
             sec_kstr.construct_regularkey(sec_key_buffer, sec_ksz);
@@ -477,7 +457,7 @@ w_rc_t fstr_wrk_thr_t::index_probe(){
         r->find_flag==HA_READ_PREFIX_LAST ? kstr.construct_posinfkey() : kstr.construct_neginfkey();
     }
 
-    StoreID idx_stid = load_stid(r->table_name, r->table->key_info[r->idx_no].name, r->table->key_info[r->idx_no].name_length);
+    StoreID idx_stid = r->stid;
     //Switch on search modes
     switch (r->find_flag) {
         case HA_READ_KEY_OR_NEXT:
@@ -535,11 +515,10 @@ w_rc_t fstr_wrk_thr_t::index_probe(){
         kstr.construct_regularkey(tmp_pk_buffer, pksz);
         smsize_t size=1;
         uchar* buf= (uchar*) my_malloc(size, MYF(MY_WME));
-        StoreID pk_stid = load_stid(r->table_name, r->table->key_info[0].name, r->table->key_info[0].name_length);
-        w_rc_t rc = foster_handle->find_assoc(pk_stid,kstr, buf, size, found);
+        w_rc_t rc = foster_handle->find_assoc(r->pkstid,kstr, buf, size, found);
         if(rc.is_error() && rc.err_num()==eRECWONTFIT){
             buf= (uchar*) my_realloc(buf, size, MYF(MY_WME));
-            foster_handle->find_assoc(pk_stid, kstr, buf, size,found);
+            foster_handle->find_assoc(r->pkstid, kstr, buf, size,found);
         }
         unpack_row(buf, size, r->mysql_format_buf, r->table);
     }
@@ -561,11 +540,10 @@ w_rc_t fstr_wrk_thr_t::next(){
             kstr.construct_regularkey(tmp_pk_buffer, pksz);
             smsize_t size=1;
             uchar* buf= (uchar*) my_malloc(size, MYF(MY_WME));
-            StoreID pk_stid = load_stid(r->table_name, r->table->key_info[0].name, r->table->key_info[0].name_length);
-            w_rc_t rc = foster_handle->find_assoc(pk_stid,kstr, buf, size, found);
+            w_rc_t rc = foster_handle->find_assoc(r->pkstid,kstr, buf, size, found);
             if(rc.is_error() && rc.err_num()==eRECWONTFIT){
                 buf= (uchar*) my_realloc(buf, size, MYF(MY_WME));
-                foster_handle->find_assoc(pk_stid, kstr, buf, size,found);
+                foster_handle->find_assoc(r->pkstid, kstr, buf, size,found);
             }
             unpack_row(buf, size, r->mysql_format_buf, r->table);
 
@@ -586,12 +564,10 @@ w_rc_t fstr_wrk_thr_t::next(){
                 kstr.construct_regularkey(tmp_pk_buffer, pksz);
                 smsize_t size = 1;
                 uchar *buf = (uchar *) my_malloc(size, MYF(MY_WME));
-                StoreID pk_stid = load_stid(r->table_name, r->table->key_info[0].name,
-                                            r->table->key_info[0].name_length);
-                w_rc_t rc = foster_handle->find_assoc(pk_stid, kstr, buf, size, found);
+                w_rc_t rc = foster_handle->find_assoc(r->pkstid, kstr, buf, size, found);
                 if (rc.is_error() && rc.err_num() == eRECWONTFIT) {
                     buf = (uchar *) my_realloc(buf, size, MYF(MY_WME));
-                    foster_handle->find_assoc(pk_stid, kstr, buf, size, found);
+                    foster_handle->find_assoc(r->pkstid, kstr, buf, size, found);
                 }
                 unpack_row(buf, size, r->mysql_format_buf, r->table);
                 return RCOK;
@@ -620,7 +596,7 @@ w_rc_t fstr_wrk_thr_t::position_read(){
     kstr.construct_regularkey(r->key_buf, r->ksz);
     uchar* record_buf;
     smsize_t size=1;
-    StoreID pk_stid = load_stid(r->table_name, r->table->key_info[0].name, r->table->key_info[0].name_length);
+    StoreID pk_stid = r->stid;
     record_buf= (uchar*) my_malloc(size, MYF(MY_WME));
     rc = foster_handle->find_assoc(pk_stid,kstr,record_buf,size, found);
     if(rc.is_error() && rc.err_num()==eRECWONTFIT){

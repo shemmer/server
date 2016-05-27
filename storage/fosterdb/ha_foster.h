@@ -36,18 +36,86 @@ typedef struct st_foster_record_buffer {
 } foster_record_buffer;
 
 
+typedef struct st_foster_idx {
+    char* index_name;
+    uint index_name_length;
+    uint stid;
+} foster_index;
+
+static uchar* foster_index_get_key(foster_index* idx, size_t *length,
+                            my_bool not_used __attribute__((unused)))
+{
+    *length=idx->index_name_length;
+    return (uchar*) idx->index_name;
+}
+
+
 class FOSTER_SHARE: Handler_share{
 public:
     char *table_name;
     uint table_name_length, use_count;
     mysql_mutex_t mutex;
     THR_LOCK lock;
-    FOSTER_SHARE(){
-        thr_lock_init(&lock);
-    }
+
+    HASH foster_indexes;
+
     ~FOSTER_SHARE(){
         thr_lock_delete(&lock);
         mysql_mutex_destroy(&mutex);
+    }
+
+
+    void init_hash(){
+        (void) my_hash_init(&foster_indexes,system_charset_info,32,0,0,
+                            (my_hash_get_key) foster_index_get_key,0,0);
+    }
+
+    foster_index* get_storeid(char* idx_name_buf, uint length){
+        foster_index* fosteridx;
+        char *tmp_name;
+        if (!(fosteridx=(foster_index*) my_hash_search(&foster_indexes, (uchar*) idx_name_buf, length)))
+        {
+                return NULL;
+        }
+        return fosteridx;
+    }
+
+    bool add_storeid(char* idx_name_buf, uint length, uint storeid){
+        char *tmp_name;
+        foster_index* fosteridx;
+        if (!my_multi_malloc(MYF(MY_WME | MY_ZEROFILL),
+                         &fosteridx, sizeof(*fosteridx),
+                         &tmp_name, length+1,
+                         NullS))
+        {
+            return false;
+        }
+
+        fosteridx->index_name=tmp_name;
+        fosteridx->index_name_length=length;
+        fosteridx->stid=storeid;
+
+        strmov(fosteridx->index_name, idx_name_buf);
+
+        if (my_hash_insert(&foster_indexes, (uchar*) fosteridx)){
+            return false;
+        }
+        return true;
+    }
+
+    std::vector<uint> get_all_storeids(){
+        std::vector<uint> stid_vector(foster_indexes.array.elements);
+        for(int i=0; i< foster_indexes.array.elements; i++){
+            foster_index* index = (foster_index*) my_hash_element(&foster_indexes, i);
+            if(strcmp(index->index_name,"PRIMARY")==0 && i!=0){
+                uint tmp = stid_vector[0];
+                stid_vector[0]=index->stid;
+                stid_vector[i]=tmp;
+            }else {
+                stid_vector[i] = index->stid;
+            }
+        }
+        return stid_vector;
     }
 };
 
