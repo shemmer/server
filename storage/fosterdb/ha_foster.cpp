@@ -191,7 +191,6 @@ static int foster_deinit_func(void *p){
 
   req->type=FOSTER_SHUTDOWN;
 
-//    mysql_cond_signal(&ha_foster::main_thread->COND_worker);
   mysql_mutex_lock(&ha_foster::main_thread->thread_mutex);
   ha_foster::main_thread->set_request(req);
   ha_foster::main_thread->notify(true);
@@ -251,6 +250,7 @@ static FOSTER_SHARE *get_share(const char *table_name)
     if (my_hash_insert(&foster_open_tables, (uchar*) share))
       goto error;
     thr_lock_init(&share->lock);
+    share->init_hash();
     mysql_mutex_init(key_mutex_foster_share,
                      &share->mutex, MY_MUTEX_INIT_FAST);
   }
@@ -313,16 +313,57 @@ int ha_foster::open(const char *name, int mode, uint test_if_locked)
   table_name = name;
   ref_length = table->key_info[0].key_length;
 
-  for(uint i=1; i<table->s->keys; i++) {
-    if (max_key_len < table->key_info[i].key_length)
-      max_key_len = table->key_info[i].key_length;
-  }
+  uint length;
+
+  char separator[4]={"###"};
+
+  char* idx_name_buf;
 
 
-  for(uint i=1; i<table->s->keys; i++) {
+
+  for(uint i=0; i<table->s->keys; i++) {
+
     if (max_key_name_len < table->key_info[i].name_length)
       max_key_len = table->key_info[i].name_length;
+
+    if(!share->get_storeid(table->s->key_info[i].name, table->s->key_info[i].name_length)){
+      discovery_request_t* req = new discovery_request_t();
+      req->type=FOSTER_DISCOVERY;
+      mysql_mutex_init(key_mutex_foster_wrk, &req->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
+      //Init the request condition -> used to signal the handler when the worker is done
+      mysql_cond_init(key_COND_work, &req->COND_work, NULL);
+      mysql_mutex_lock(&req->LOCK_work_mutex);
+      length=(uint) strlen(table_name) + (uint) table->s->key_info[i].name_length + 3;
+      idx_name_buf = (char*)my_malloc(length, MYF(MY_WME));
+      memcpy(idx_name_buf, table_name, strlen(table_name));
+      idx_name_buf += strlen(table_name);
+      memcpy(idx_name_buf, separator, 3);
+      idx_name_buf+=3;
+      memcpy(idx_name_buf, table->s->key_info[i].name,  table->s->key_info[i].name_length);
+      idx_name_buf -= (strlen(table_name)+3);
+
+      req->idx_name_buf=idx_name_buf;
+      req->idx_name_buf_len=length;
+      mysql_mutex_lock(&main_thread->thread_mutex);
+       main_thread->set_request(req);
+      main_thread->notify(true);
+      mysql_cond_broadcast(&main_thread->COND_worker);
+      mysql_mutex_unlock(&main_thread->thread_mutex);
+
+      while(!req->notified){
+        mysql_cond_wait(&req->COND_work, &req->LOCK_work_mutex);
+      }
+      mysql_mutex_unlock(&req->LOCK_work_mutex);
+
+      if(!share->add_storeid(table->s->key_info[i].name, table->s->key_info[i].name_length, *req->stid)){
+          //TODO error msg
+      }
+      my_free(idx_name_buf);
+      mysql_mutex_destroy(&req->LOCK_work_mutex);
+      delete(req);
+    }
   }
+
 
   key_buffer = (uchar*) my_malloc(max_key_len, MYF(MY_WME));
   if (key_buffer == 0)
@@ -440,6 +481,7 @@ int ha_foster::write_row(uchar *buf) {
   req->table_name.set(table_name, strlen(table_name), &my_charset_bin);
 
   req->mysql_format_buf=buf;
+  req->stids= share->get_all_storeids();
 
   if (fix_rec_buff(max_row_length(buf)))
     DBUG_RETURN(HA_ERR_OUT_OF_MEM);
@@ -487,6 +529,7 @@ int ha_foster::update_row(const uchar *old_data, uchar *new_data)
   req->rec_buf=record_buffer->buffer;
   req->table=table;
 
+  req->stids=share->get_all_storeids();
 
   mysql_mutex_lock(&worker->thread_mutex);
   worker->set_request(req);
@@ -583,8 +626,14 @@ int ha_foster::index_read_idx_map(uchar * buf, uint index, const uchar * key,
   req->find_flag=find_flag;
   req->mysql_format_buf=buf;
   req->table=table;
-
   req->idx_no=index;
+
+
+  if(index!=0)
+    req->pkstid=share->get_storeid(table->s->key_info[0].name,
+                                   table->s->key_info[0].name_length)->stid;
+  req->stid=share->get_storeid(table->s->key_info[index].name, table->s->key_info[index].name_length)->stid;
+
 
   mysql_mutex_lock(&worker->thread_mutex);
   worker->set_request(req);
@@ -632,8 +681,13 @@ int ha_foster::index_read(uchar *buf, const uchar *key, uint key_len,
   req->find_flag=find_flag;
   req->mysql_format_buf=buf;
   req->table=table;
-
   req->idx_no=active_index;
+
+  if(active_index!=0)
+    req->pkstid=share->get_storeid(table->s->key_info[0].name,
+                                   table->s->key_info[0].name_length)->stid;
+  req->stid=share->get_storeid(table->s->key_info[active_index].name,
+                               table->s->key_info[active_index].name_length)->stid;
 
   mysql_mutex_lock(&worker->thread_mutex);
   worker->set_request(req);
@@ -677,6 +731,13 @@ int ha_foster::index_next(uchar *buf)
   req->mysql_format_buf=buf;
   req->table=table;
   req->idx_no=active_index;
+  
+  if(active_index!=0)
+    req->pkstid=share->get_storeid(table->s->key_info[0].name,
+                                   table->s->key_info[0].name_length)->stid;
+
+  req->stid=share->get_storeid(table->s->key_info[active_index].name,
+                               table->s->key_info[active_index].name_length)->stid;
 
   mysql_mutex_lock(&worker->thread_mutex);
   worker->set_request(req);
@@ -760,6 +821,8 @@ int ha_foster::rnd_next(uchar *buf)
   req->table=table;
   req->idx_no=0;
 
+  req->stid=share->get_storeid(table->s->key_info[0].name, table->s->key_info[0].name_length)->stid;
+
   if(first_row){
     first_row=false;
     req->key_buf =0;
@@ -825,6 +888,7 @@ int ha_foster::rnd_pos(uchar *buf, uchar *pos)
   req->table=table;
   req->key_buf=pos;
   req->ksz=ref_length;
+  req->stid=share->get_storeid(table->s->key_info[0].name, table->s->key_info[0].name_length)->stid;
 
   req->type=FOSTER_POS_READ;
 

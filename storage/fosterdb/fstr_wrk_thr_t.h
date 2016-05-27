@@ -15,6 +15,7 @@
 const int FOSTER_STARTUP =1;
 const int FOSTER_SHUTDOWN=2;
 
+const int FOSTER_DISCOVERY=3;
 
 const int FOSTER_CREATE= 5;
 const int FOSTER_DELETE= 6;
@@ -40,10 +41,19 @@ struct base_request_t{
     int err;
 };
 
+
+struct discovery_request_t : base_request_t{
+    char* idx_name_buf;
+    size_t idx_name_buf_len;
+    uint* stid;
+};
+
 struct start_stop_request_t : base_request_t{
     char* db;
     char* logdir;
 };
+
+
 
 struct ddl_request_t : base_request_t{
     String table_name;
@@ -53,6 +63,8 @@ struct ddl_request_t : base_request_t{
 };
 
 struct write_request_t : base_request_t{
+    std::vector<uint> stids;
+
     uchar* mysql_format_buf;
 
     uchar* old_mysql_format_buf;
@@ -65,13 +77,13 @@ struct write_request_t : base_request_t{
 
     uint maxlength;
 
-
     TABLE* table;
     uint max_key_len;
 };
 
 
 struct read_request_t : base_request_t{
+    uint stid;
     ha_rkey_function find_flag;
 
     uchar* key_buf;
@@ -84,6 +96,8 @@ struct read_request_t : base_request_t{
 
     int idx_no;
     TABLE* table;
+
+    uint pkstid;
 };
 
 
@@ -102,6 +116,8 @@ class fstr_wrk_thr_t : public smthread_t{
     w_rc_t shutdown();
 
     int work_ACTIVE();
+
+    w_rc_t discover_table();
 
     w_rc_t create_physical_table();
     w_rc_t delete_table();
