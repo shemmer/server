@@ -202,9 +202,6 @@ w_rc_t fstr_wrk_thr_t::startup() {
         W_COERCE(foster_handle->create_index(cat_stid));
         w_assert0(cat_stid == 1);
         W_COERCE(foster_handle->commit_xct());
-//        ss_m::checkpoint();
-    }else{
-        StoreID cat_stid;
     }
     DBUG_RETURN(RCOK);
 }
@@ -232,11 +229,12 @@ int fstr_wrk_thr_t::extract_key(uchar *key, int key_num, const uchar *record, TA
     key_copy(key, const_cast<uchar*>(record), &table->key_info[key_num], 0);
     return  table->key_info[key_num].key_length;
 }
-
+/**
+ * Memory -> Disk
+ */
 int fstr_wrk_thr_t::pack_row(uchar *from, TABLE* table, uchar* buffer)
 {
     uchar* ptr;
-    /* Copy null bits */
     memcpy(buffer, from, table->s->null_bytes);
     ptr= buffer + table->s->null_bytes;
 
@@ -506,13 +504,15 @@ w_rc_t fstr_wrk_thr_t::index_probe(){
     }else{
         bool found;
         uint pksz = r->table->key_info[0].key_length;
-        sec_idx_offset=pksz;
+
+        curr_numberOfRecs =cursor->elem()[0];
+        curr_element=0;
+
         uchar* tmp_pk_buffer = (uchar*) my_malloc((size_t) pksz, MYF(MY_WME));
-        for(int i=0; i<pksz; i++){
-            tmp_pk_buffer[i] = (uchar) cursor->elem()[i];
-        }
+        memcpy(tmp_pk_buffer, cursor->elem()+curr_element*pksz+1, pksz);
         w_keystr_t kstr;
         kstr.construct_regularkey(tmp_pk_buffer, pksz);
+        //TODO can we get this better?
         smsize_t size=1;
         uchar* buf= (uchar*) my_malloc(size, MYF(MY_WME));
         w_rc_t rc = foster_handle->find_assoc(r->pkstid,kstr, buf, size, found);
@@ -529,13 +529,13 @@ w_rc_t fstr_wrk_thr_t::index_probe(){
 w_rc_t fstr_wrk_thr_t::next(){
     read_request_t* r = static_cast<read_request_t*>(req);
     if(r->idx_no!=0){
-        if(sec_idx_offset<cursor->elen()){
+        curr_element++;
+        if(curr_element<curr_numberOfRecs){
             bool found;
             uint pksz = r->table->key_info[0].key_length;
             uchar* tmp_pk_buffer = (uchar*) my_malloc((size_t) pksz, MYF(MY_WME));
-            for(int i=0; i<pksz; i++){
-                tmp_pk_buffer[i] = (uchar) cursor->elem()[sec_idx_offset+i];
-            }
+
+            memcpy(tmp_pk_buffer, cursor->elem()+curr_element*pksz+1, pksz);
             w_keystr_t kstr;
             kstr.construct_regularkey(tmp_pk_buffer, pksz);
             smsize_t size=1;
@@ -547,19 +547,18 @@ w_rc_t fstr_wrk_thr_t::next(){
             }
             unpack_row(buf, size, r->mysql_format_buf, r->table);
 
-            sec_idx_offset+=pksz;
-
             return RCOK;
         }else{
             W_COERCE(cursor->next());
             if(!cursor->eof()) {
+                curr_numberOfRecs =cursor->elem()[0];
+                curr_element=0;
+
                 bool found;
                 uint pksz = r->table->key_info[0].key_length;
-                sec_idx_offset = pksz;
                 uchar *tmp_pk_buffer = (uchar *) my_malloc((size_t) pksz, MYF(MY_WME));
-                for (int i = 0; i < pksz; i++) {
-                    tmp_pk_buffer[i] = (uchar) cursor->elem()[i];
-                }
+
+                memcpy(tmp_pk_buffer, cursor->elem()+curr_element*pksz+1, pksz);
                 w_keystr_t kstr;
                 kstr.construct_regularkey(tmp_pk_buffer, pksz);
                 smsize_t size = 1;
@@ -596,12 +595,11 @@ w_rc_t fstr_wrk_thr_t::position_read(){
     kstr.construct_regularkey(r->key_buf, r->ksz);
     uchar* record_buf;
     smsize_t size=1;
-    StoreID pk_stid = r->stid;
     record_buf= (uchar*) my_malloc(size, MYF(MY_WME));
-    rc = foster_handle->find_assoc(pk_stid,kstr,record_buf,size, found);
+    rc = foster_handle->find_assoc(r->stid,kstr,record_buf,size, found);
     if(rc.is_error() && rc.err_num()==eRECWONTFIT){
         record_buf = (uchar *) my_realloc(record_buf, size, MYF(MY_WME));
-        rc = foster_handle->find_assoc(pk_stid,kstr,record_buf,size, found);
+        rc = foster_handle->find_assoc(r->stid,kstr,record_buf,size, found);
     }
     unpack_row(record_buf, size, r->mysql_format_buf, r->table);
     return rc;
@@ -610,103 +608,142 @@ w_rc_t fstr_wrk_thr_t::position_read(){
 
 
 int fstr_wrk_thr_t::add_to_secondary_idx(StoreID sec_id, w_keystr_t sec_kstr, w_keystr_t primary){
+
     w_rc_t rc;
     bool found;
-    //Length of a key in bytes
-    int pksz=primary.get_length_as_nonkeystr();
-    w_rc_t sec_rc = foster_handle->create_assoc(sec_id, sec_kstr, vec_t(primary.serialize_as_nonkeystr().data(), pksz));
-    if(sec_rc.is_error() && sec_rc.err_num()==eDUPLICATE){
-        uchar* old_buf;
-        smsize_t len = (smsize_t) pksz;
-        //ksz = size of primary keys
-        //Get pks already under the secondary idx with the same sec_key
-        old_buf= (uchar*)my_malloc((size_t) pksz, MYF(MY_WME));
-        rc = foster_handle->find_assoc(sec_id, sec_kstr, old_buf, len, found);
-        if(rc.is_error() && rc.err_num()==eRECWONTFIT) {
-            old_buf = (uchar *) my_realloc(old_buf, len, MYF(MY_WME));
-            W_COERCE(foster_handle->find_assoc(sec_id, sec_kstr, old_buf, len, found));
-        }
+    smsize_t size=primary.get_length_as_nonkeystr();
+    uchar* record_buf= (uchar*) my_malloc(size, MYF(MY_WME | MY_ZEROFILL));
+    rc = foster_handle->find_assoc(sec_id,sec_kstr,record_buf,size, found);
+    if(rc.is_error() && rc.err_num()==eRECWONTFIT){
+        record_buf = (uchar *) my_realloc(record_buf, size, MYF(MY_WME | MY_ZEROFILL));
+        rc = foster_handle->find_assoc(sec_id,sec_kstr,record_buf,size, found);
+    }
+    if(found){
+        uint pksz = primary.get_length_as_nonkeystr();
+        uint numberOfRecs= record_buf[0]+1;
 
-        uchar* tmp_pk_buffer = (uchar*) my_malloc((size_t) pksz, MYF(MY_WME));
-        uchar* new_buffer = (uchar*) my_malloc(len+pksz, MYF(MY_WME));
+        uchar* new_buf = (uchar*) my_malloc(numberOfRecs*pksz+1, MYF(MY_WME | MY_ZEROFILL));
+        uchar* curr=new_buf;
+        *curr++=numberOfRecs;
+        uchar* tmp_pk_buffer = (uchar*) my_malloc(pksz, MYF(MY_WME));
 
         w_keystr_t compare_key;
+        record_buf++;
 
-        bool done=false;
-        for(int i=0; i<len;i+=pksz){
-            for(int j=0; j<pksz; j++) {
-                tmp_pk_buffer[j] = old_buf[i + j];
-            }
+        bool done;
+
+        for(int i=0; i< numberOfRecs-1; i++){
+            memcpy(tmp_pk_buffer, record_buf+(i*pksz), pksz);
             compare_key.construct_regularkey(tmp_pk_buffer, pksz);
-
-            if(compare_key.compare(primary)>0){
-                for(int k=0; k<i; k++){
-                    new_buffer[k]=old_buf[k];
-                }
-                for(int k=0; k<pksz; k++){
-                    new_buffer[i+k]=primary.serialize_as_nonkeystr().data()[k];
-                }
-                for(int k=0; k<len-i; k++){
-                    new_buffer[i+pksz+k]= old_buf[i+k];
-                }
+            if(compare_key.compare(primary)>0 && !done){
+                memcpy(curr,primary.serialize_as_nonkeystr().c_str(), pksz);
+                curr+=pksz;
+                memcpy(curr, tmp_pk_buffer, pksz);
+                curr+=pksz;
                 done=true;
-                break;
+            }else{
+                memcpy(curr, tmp_pk_buffer, pksz);
+                curr+=pksz;
             }
+        }
+        if(!done){
+            memcpy(curr,primary.serialize_as_nonkeystr().c_str(),pksz);
         }
         my_free(tmp_pk_buffer);
-        if(!done){
-            int i;
-            for(i=0; i< len; i++){
-                new_buffer[i]=old_buf[i];
-            }
-            for(int j=0; j< pksz;j++){
-                new_buffer[i+j]=primary.serialize_as_nonkeystr().data()[j];
-            }
-        }
-        foster_handle->put_assoc(sec_id,sec_kstr,vec_t(new_buffer, len+pksz));
-        my_free(new_buffer);
-        my_free(old_buf);
+        foster_handle->put_assoc(sec_id,sec_kstr,vec_t(new_buf, numberOfRecs*pksz+1));
+        my_free(new_buf);
+        my_free(--record_buf);
+        return 0;
+    }else{
+        record_buf = (uchar*) my_realloc(record_buf, primary.get_length_as_nonkeystr() + 1, MYF(MY_WME));
+        //NumberOfRecs
+        *record_buf++=1;
+        memcpy(record_buf,primary.serialize_as_nonkeystr().c_str(), primary.get_length_as_nonkeystr());
+        record_buf--;
+        foster_handle->create_assoc(sec_id, sec_kstr, vec_t(record_buf, primary.get_length_as_nonkeystr()+ 1));
+        my_free(record_buf);
+        return 0;
     }
 }
 
 int fstr_wrk_thr_t::delete_from_secondary_idx(StoreID sec_id, w_keystr_t sec_kstr, w_keystr_t primary){
     w_rc_t rc;
     bool found;
-    int pksz=primary.get_length_as_nonkeystr();
-
-    uchar* old_buf;
-    smsize_t len;
-    //ksz = size of primary keys
-    //Get pks already under the secondary idx with the same sec_key
-    old_buf= (uchar*)my_malloc((size_t) pksz, MYF(MY_WME));
-    rc = foster_handle->find_assoc(sec_id, sec_kstr, old_buf, len, found);
-    if(rc.is_error() && rc.err_num()==eRECWONTFIT) {
-        old_buf = (uchar *) my_realloc(old_buf, len, MYF(MY_WME));
-        rc = foster_handle->find_assoc(sec_id, sec_kstr, old_buf, len, found);
+    smsize_t size=primary.get_length_as_nonkeystr()+1;
+    uchar* record_buf= (uchar*) my_malloc(size, MYF(MY_WME | MY_ZEROFILL));
+    rc = foster_handle->find_assoc(sec_id,sec_kstr,record_buf,size, found);
+    if(rc.is_error() && rc.err_num()==eRECWONTFIT){
+        record_buf = (uchar *) my_realloc(record_buf, size, MYF(MY_WME | MY_ZEROFILL));
+        rc = foster_handle->find_assoc(sec_id,sec_kstr,record_buf,size, found);
     }
+    if(found){
+        uint pksz = primary.get_length_as_nonkeystr();
+        uint numberOfRecs= record_buf[0]-1;
 
-    uchar* tmp_pk_buffer = (uchar*) my_malloc((size_t) pksz, MYF(MY_WME));
-    uchar* new_buffer = (uchar*) my_malloc(len-pksz, MYF(MY_WME));
-    //0 if equal. <0 if this<r, >0 if this>r
-    w_keystr_t compare_key;
-    for(int i=0; i<len;i+=pksz){
-        //Create a temporary buffer by extracting
-        for(int j=0; j<pksz; j++) {
-            tmp_pk_buffer[j] = old_buf[i + j];
-        }
-        compare_key.construct_regularkey(tmp_pk_buffer, pksz);
-        if(compare_key.compare(primary)==0){
-            for(int k=0; k<i; k++){
-                new_buffer[k]=old_buf[k];
+        uchar* new_buf = (uchar*) my_malloc(numberOfRecs*pksz+1, MYF(MY_WME | MY_ZEROFILL));
+        uchar* curr=new_buf;
+        *curr++=numberOfRecs;
+        uchar* tmp_pk_buffer = (uchar*) my_malloc(pksz, MYF(MY_WME));
+
+        w_keystr_t compare_key;
+        record_buf++;
+
+        bool done;
+
+        for(int i=0; i< numberOfRecs+1; i++){
+            memcpy(tmp_pk_buffer, record_buf+(i*pksz), pksz);
+            compare_key.construct_regularkey(tmp_pk_buffer, pksz);
+            if(compare_key.compare(primary)!=0){
+                memcpy(curr, tmp_pk_buffer, pksz);
+                curr+=pksz;
             }
-            for(int k=i; k<len-pksz; k++){
-                new_buffer[k]= old_buf[k+pksz];
-            }
-            break;
         }
+
+        my_free(tmp_pk_buffer);
+        foster_handle->put_assoc(sec_id,sec_kstr,vec_t(new_buf, numberOfRecs*pksz+1));
+        my_free(new_buf);
+        my_free(--record_buf);
+        return 0;
+    }else{
+        return 1;
     }
-    my_free(tmp_pk_buffer);
-    foster_handle->put_assoc(sec_id,sec_kstr,vec_t(new_buffer, len-pksz));
+//
+//
+//    int pksz=primary.get_length_as_nonkeystr();
+//
+//    uchar* old_buf;
+//    smsize_t len;
+//    //ksz = size of primary keys
+//    //Get pks already under the secondary idx with the same sec_key
+//    old_buf= (uchar*)my_malloc((size_t) pksz, MYF(MY_WME));
+//    rc = foster_handle->find_assoc(sec_id, sec_kstr, old_buf, len, found);
+//    if(rc.is_error() && rc.err_num()==eRECWONTFIT) {
+//        old_buf = (uchar *) my_realloc(old_buf, len, MYF(MY_WME));
+//        rc = foster_handle->find_assoc(sec_id, sec_kstr, old_buf, len, found);
+//    }
+//
+//    uchar* tmp_pk_buffer = (uchar*) my_malloc((size_t) pksz, MYF(MY_WME));
+//    uchar* new_buffer = (uchar*) my_malloc(len-pksz, MYF(MY_WME));
+//    //0 if equal. <0 if this<r, >0 if this>r
+//    w_keystr_t compare_key;
+//    for(int i=0; i<len;i+=pksz){
+//        //Create a temporary buffer by extracting
+//        for(int j=0; j<pksz; j++) {
+//            tmp_pk_buffer[j] = old_buf[i + j];
+//        }
+//        compare_key.construct_regularkey(tmp_pk_buffer, pksz);
+//        if(compare_key.compare(primary)==0){
+//            for(int k=0; k<i; k++){
+//                new_buffer[k]=old_buf[k];
+//            }
+//            for(int k=i; k<len-pksz; k++){
+//                new_buffer[k]= old_buf[k+pksz];
+//            }
+//            break;
+//        }
+//    }
+//    my_free(tmp_pk_buffer);
+//    foster_handle->put_assoc(sec_id,sec_kstr,vec_t(new_buffer, len-pksz));
 
 }
 

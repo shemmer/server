@@ -110,7 +110,8 @@ class fstr_wrk_thr_t : public smthread_t{
 
     base_request_t* req;
 
-    uint sec_idx_offset;
+    uint curr_numberOfRecs;
+    uint curr_element;
 
     w_rc_t startup();
     w_rc_t shutdown();
