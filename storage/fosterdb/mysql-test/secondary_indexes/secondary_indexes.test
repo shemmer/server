@@ -1,0 +1,98 @@
+drop table if exists t;
+create table t (a int primary key, b int, c int, d int, e blob, f VARCHAR(50),
+ INDEX bcdindex (b,c,d)) engine=foster;
+
+insert t values (1,2,3,4,"foo","bar"), (3,4,5,6, "test","TU"), (5,6,7,8,"mariadb", "foster");
+
+select a from t;
+
+select * from t where a > 3;
+select * from t where a = 2;
+select * from t force index (primary) where a > -1;
+select * from t force index (primary) where a < 5 order by a desc;
+select * from t where b = 4 and c = 5 and d = 6;
+select * from t where b = 4 and c = 5 and d = 7;
+select * from t where b = 4 and c = 5 and d > 2;
+select * from t where b between 3 and 5;
+select * from t where b = 4;
+select * from t where b = 4 order by b;
+select * from t where b = 4 order by b,c,d;
+select * from t where b = 4 order by b desc;
+select * from t where b = 4 order by b desc, c desc, d desc;
+select * from t where b = 100 order by b desc, c desc, d desc;
+select * from t where b > 4 order by b;
+select * from t where b > 4 order by b desc;
+select * from t where b > 7;
+select * from t where b = 100;
+select * from t where b > 100;
+select * from t where b >= 100;
+select * from t where b <= 100 order by b desc;
+select * from t where b < 100 order by b desc;
+select * from t where a <= -1 order by a desc;
+select * from t where a < 0 order by a desc;
+select * from t order by e;
+
+insert t values (4,4,5,6,"test", "something");
+
+delete from t where a=4;
+
+select * from t;
+
+select * from t where b<100;
+
+insert t values (4,4,5,6,"test", "something");
+
+delete from t where f="something";
+
+select * from t;
+
+select * from t where b<100;
+
+insert t values (4,4,5,6,"test", "something");
+
+update t set e="more" where f="something";
+
+select * from t;
+
+select * from t where b<100;
+
+
+drop table if exists t;
+create table t (a int primary key, b int, c int, d int, e blob, f VARCHAR(50),
+ INDEX bcdindex (b,c,d,f)) engine=foster;
+
+insert t values (1,2,3,4,"foo","bar"),
+ (3,4,5,6, "test","TU"),
+ (5,6,7,8,"mariadb", "foster"),
+ (8,6,7,8,"mariadb", "foster"),
+ (7,6,7,8,"mariadb", "foster"),
+ (10,20,30,49,"foo", "something")
+ ;
+
+select * from t;
+select * from t where b=6 and c=7 and f='foster';
+
+insert t values (4,4,5,6,"test", "something");
+
+delete from t where a=4;
+
+select * from t;
+
+select * from t where b<100;
+
+insert t values (4,4,5,6,"test", "something");
+
+delete from t where f="something";
+
+select * from t;
+
+select * from t where b<100;
+
+insert t values (4,4,5,6,"test", "something");
+
+update t set e="more" where f="something";
+
+select * from t;
+
+select * from t where b<100;
+

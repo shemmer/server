@@ -1,0 +1,70 @@
+drop table if exists parent;
+drop table if exists child;
+
+create table parent (a int PRIMARY KEY, b int , c VARCHAR(50)) engine=foster;
+
+create table child (child_a int PRIMARY KEY, b int NOT NULL, c VARCHAR(50),
+FOREIGN KEY (b) REFERENCES parent (a) ON DELETE CASCADE) engine=foster;
+
+insert into parent values (1,1,'test'), (2,3, 'foo') ,( 3,2, 'bar');
+
+insert into child values (1,1,'TU'), (3,2, 'bar'), (2,3,'foo');
+
+select * from parent;
+
+select * from child;
+
+delete from parent where a=2;
+
+select * from child;
+
+
+drop table if exists parent;
+drop table if exists child;
+drop table if exists child1;
+
+create table parent (a int PRIMARY KEY, b int , c VARCHAR(50) NOT NULL, INDEX cindex (c)) engine=foster;
+
+create table child (child_a int PRIMARY KEY, refb int NOT NULL, c VARCHAR(50),
+FOREIGN KEY (refb) REFERENCES parent (a) ON DELETE CASCADE) engine=foster;
+
+create table child1 (child1_a int PRIMARY KEY, b1 int NOT NULL, c1 VARCHAR(50) NOT NULL,
+FOREIGN KEY (c1) REFERENCES parent (c) ON DELETE CASCADE) engine=foster;
+
+
+insert into parent values (1,1,'test'), (2,3, 'foo') ,( 3,2, 'bar');
+
+insert into child values (11,1,'TU'), (13,2, 'bar'), (12,3,'foo');
+
+insert into child1 values (10,11,'test'), (31,21, 'foo'), (21,31,'bar');
+
+insert into child1 values (20,1,'test'), (30, 2, 'foo'), (40,3,'bar');
+
+delete from parent where a=2;
+
+select * from child;
+
+select * from child1;
+
+
+drop table if exists child;
+drop table if exists parent;
+
+create table parent (a int PRIMARY KEY, b int NOT NULL ,
+                    c VARCHAR(50) NOT NULL, INDEX cindex (c), INDEX bindex (b)) engine=foster;
+
+create table child (child_a int PRIMARY KEY, refb int NOT NULL, refc VARCHAR(50) NOT NULL,
+FOREIGN KEY (refb) REFERENCES parent (b) ON DELETE CASCADE,
+FOREIGN KEY (refc) REFERENCES parent (c) ON DELETE CASCADE) engine=foster;
+
+
+insert into parent values (1,1,'test'), (2,3,'foo'),( 3,2, 'bar');
+
+insert into child values (1,1,'test'), (2,3, 'bar'), (3,2,'foo');
+
+
+select * from child;
+delete from parent where a=2;
+select * from child;
+select * from child where refb=1;
+select * from child where refc="test";

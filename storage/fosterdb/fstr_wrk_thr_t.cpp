@@ -2,39 +2,33 @@
 // Created by stefan on 16.03.16.
 //
 
-#include <key.h>
-#include <my_base.h>
-
 #include "fstr_wrk_thr_t.h"
 
-
-#include "sm_vas.h"
 #include "btcursor.h"
-
 
 
 ss_m* fstr_wrk_thr_t::foster_handle;
 
 fstr_wrk_thr_t::fstr_wrk_thr_t(bool begin):
-        _begin_tx(begin), smthread_t(t_regular, "trx_worker"){
-    init_foster_psi_keys();
-    mysql_mutex_init(key_mutex_foster_wrker,
-                     &thread_mutex, MY_MUTEX_INIT_FAST);
-    mysql_cond_init(key_COND_worker, &COND_worker, NULL);
+         smthread_t(t_regular, "trx_worker"), _begin_tx(begin){
+//    init_foster_psi_keys();
+    pthread_mutex_init(&thread_mutex, NULL);
+    pthread_cond_init(&COND_worker, NULL);
     notified = false;
+    aborted=false;
     this->fork();
 }
 
 
 
 void fstr_wrk_thr_t::foster_exit(){
-    mysql_mutex_lock(&thread_mutex);
+    pthread_mutex_lock(&thread_mutex);
     notify(true);
     _exit=true;
-    mysql_cond_signal(&COND_worker);
-    mysql_mutex_unlock(&thread_mutex);
+    pthread_cond_signal(&COND_worker);
+    pthread_mutex_unlock(&thread_mutex);
     join();
-    mysql_mutex_destroy(&thread_mutex);
+    pthread_mutex_destroy(&thread_mutex);
 }
 
 
@@ -96,7 +90,7 @@ void fstr_wrk_thr_t::foster_config(sm_options* options){
 
     options->set_int_option("sm_preventive_chkpt", 0);
 
-    options->set_int_option("sm_chkpt_interval", 10000);
+    options->set_int_option("sm_chkpt_interval", 100000);
 
     ifstream dbFile(opt_dbfile.c_str());
     if(!dbFile){
@@ -112,28 +106,26 @@ void fstr_wrk_thr_t::foster_config(sm_options* options){
 
 
 void fstr_wrk_thr_t::run(){
-    DBUG_ENTER("fstr_wrk_thr::run");
     int rval=0;
     while(true){
-        mysql_mutex_lock(&thread_mutex);
+        pthread_mutex_lock(&thread_mutex);
         while(!notified){
-            mysql_cond_wait(&COND_worker, &thread_mutex);
+            pthread_cond_wait(&COND_worker, &thread_mutex);
         }
-        mysql_mutex_unlock(&thread_mutex);
+        pthread_mutex_unlock(&thread_mutex);
         notified=false;
-        if(_exit) DBUG_VOID_RETURN;
+        if(_exit) return;
         if(_begin_tx){
             W_COERCE(foster_handle->begin_xct());
             _begin_tx=false;
         }
         rval = work_ACTIVE();
-        if(rval) DBUG_VOID_RETURN;
+        if(rval) return;
     }
 }
 
 
 int fstr_wrk_thr_t::work_ACTIVE(){
-    DBUG_ENTER("fstr_wrk_thr::work_ACTIVE");
     w_rc_t err;
     switch(req->type){
         case FOSTER_STARTUP:
@@ -141,94 +133,99 @@ int fstr_wrk_thr_t::work_ACTIVE(){
         case FOSTER_SHUTDOWN:
             err=shutdown();break;
             case FOSTER_DISCOVERY:
-            err=discover_table(); break;
+            err=discover_table(static_cast<discovery_request_t*>(req)); break;
         case FOSTER_CREATE:
-            err=create_physical_table();break;
+            err=create_physical_table(static_cast<ddl_request_t*>(req));break;
         case FOSTER_DELETE:
-            err=delete_table(); break;
+            err=delete_table(static_cast<ddl_request_t*>(req)); break;
         case FOSTER_WRITE_ROW:
-            err=add_tuple(); break;
+            err=add_tuple(static_cast<write_request_t*>(req)); break;
         case FOSTER_UPDATE_ROW:
-            update_tuple(); break;
+            update_tuple(static_cast<write_request_t*>(req)); break;
         case FOSTER_DELETE_ROW:
-            err=delete_tuple(); break;
+            err=delete_tuple(static_cast<write_request_t*>(req)); break;
         case FOSTER_IDX_READ:
-            err=index_probe(); break;
+            err=index_probe(static_cast<read_request_t*>(req)); break;
         case FOSTER_IDX_NEXT:
-            err=next(); break;
+            err=next(static_cast<read_request_t*>(req)); break;
         case FOSTER_POS_READ:
-            err=position_read(); break;
+            err=position_read(static_cast<read_request_t*>(req)); break;
         case FOSTER_COMMIT:
-            foster_commit(); break;
+            err=foster_commit(); break;
         case FOSTER_ROLLBACK:
             err=foster_rollback();break;
         default: break;
     }
-    if(err.is_error()) {
-        switch (err.err_num()) {
-            case eDUPLICATE:
-                req->err = HA_ERR_FOUND_DUPP_KEY;break;
-            default:
-                req->err = err.err_num();break;
-        }
-    }else{
-        req->err=0;
-    }
+    req->err=translate_err_code(err.err_num());
     req->notified=true;
-    mysql_cond_signal(&req->COND_work);
-    DBUG_RETURN(0);
+    pthread_cond_signal(&req->COND_work);
+    return 0;
 }
 
 w_rc_t fstr_wrk_thr_t::shutdown() {
-    DBUG_ENTER("fstr_wrk_thr::shutdown");
     delete(foster_handle);
-    DBUG_RETURN(RCOK);
+    return RCOK;
 }
 
 w_rc_t fstr_wrk_thr_t::startup() {
-    DBUG_ENTER("fstr_wrk_thr::startup");
     sm_options* options = new sm_options();
     foster_config(options);
     foster_handle = new ss_m(*options);
     vol_t *vol = ss_m::vol;
-
     w_assert0(vol);
     if (!vol->is_alloc_store(1))
     {
-        // create catalog index (must be on stid 1) if its not allocated create a new one
         StoreID cat_stid =1;
-
         W_COERCE(foster_handle->begin_xct());
         W_COERCE(foster_handle->create_index(cat_stid));
         w_assert0(cat_stid == 1);
         W_COERCE(foster_handle->commit_xct());
     }
-    DBUG_RETURN(RCOK);
+    return RCOK;
 }
 
 
-
-w_rc_t fstr_wrk_thr_t::discover_table()
+w_keystr_t foster_key_copy(uchar *to_key, uchar *from_record, FosterIndexInfo::Reader *key_info)
 {
-    discovery_request_t* r = static_cast<discovery_request_t*>(req);
-    w_keystr_t kstr;
-    kstr.construct_regularkey(r->idx_name_buf, r->idx_name_buf_len);
-    StoreID stid;
-    StoreID cat_stid =1;
-    smsize_t size = sizeof(StoreID);
-    bool found;
-    W_COERCE(ss_m::find_assoc(cat_stid, kstr, &stid, size, found));
-    r->stid=&stid;
-}
+    w_keystr_t ret;
+    uint key_length = key_info->getKeylength();
 
-/**
- * Extract a key with "key_num" from a record into "key"
- */
-int fstr_wrk_thr_t::extract_key(uchar *key, int key_num, const uchar *record, TABLE* table)
-{
-    key_copy(key, const_cast<uchar*>(record), &table->key_info[key_num], 0);
-    return  table->key_info[key_num].key_length;
+    int blob_length=2;
+    uchar* keypos= to_key;
+    ::capnp::List<FosterFieldInfo>::Reader parts = key_info->getPartinfo();
+    for(uint i=0; i< parts.size(); i++){
+        FosterFieldInfo::Reader key_part = parts[i];
+        if(key_part.getNullBit()!=0){
+            //Dont copy null values
+            if((from_record[key_part.getNullOffset()] & key_part.getNullBit())) {
+                *keypos++=1;
+                bzero((char*) keypos, key_length-1);
+                continue;
+            }else{
+                *keypos++=0;
+            }
+        }
+
+        if(key_part.getBlob()|| key_part.getVarlength()){
+            //the actual length of the varchar can also be stored in 2 bytes
+            uint actualLength = (uint) from_record[key_part.getOffset()];
+            uchar *pos= &from_record[key_part.getOffset()]+1;
+            *((uint16_t*) (keypos)) = (uint16_t) from_record[key_part.getOffset()];
+            memcpy(keypos+2,pos, actualLength);
+            if(actualLength < key_part.getLength()) {
+                bzero(keypos + 2 + actualLength, (key_part.getLength() - actualLength));
+            }
+            keypos+=key_part.getLength()+2;
+        }else{
+            uchar* record_key_pos= &from_record[key_part.getOffset()];
+            memcpy(keypos,record_key_pos, key_part.getLength());
+            keypos+=key_part.getLength();
+        }
+    }
+    ret.construct_regularkey(to_key,key_length);
+    return ret;
 }
+<<<<<<< HEAD
 /**
  * Memory -> Disk
  */
@@ -237,195 +234,488 @@ int fstr_wrk_thr_t::pack_row(uchar *from, TABLE* table, uchar* buffer)
     uchar* ptr;
     memcpy(buffer, from, table->s->null_bytes);
     ptr= buffer + table->s->null_bytes;
+=======
 
-    for (Field **field=table->field ; *field ; field++)
-    {
-        if (!((*field)->is_null()))
-            ptr= (*field)->pack(ptr, from + (*field)->offset(from));
-    }
-    return (unsigned int) (ptr - buffer);
-}
-/**
- * Disk->Memory
- */
-int fstr_wrk_thr_t::unpack_row(uchar *record, int row_len, uchar *&to, TABLE* table)
-{
-    /* Copy null bits */
-    const uchar* end= record+ row_len;
-    memcpy(to, record, table->s->null_bytes);
-    record+=table->s->null_bytes;
-    if (record > end)
-        return HA_ERR_WRONG_IN_RECORD;
-    for (Field **field=table->field ; *field ; field++)
-    {
-        if (!((*field)->is_null_in_record(to)))
-        {
-            if (!(record= const_cast<uchar*>((*field)
-                    ->unpack(to + (*field)->offset(table->record[0]),record, end))))
-                return HA_ERR_WRONG_IN_RECORD;
-        }
-    }
-    if (record != end)
-        return HA_ERR_WRONG_IN_RECORD;
-    return 0;
-}
-w_rc_t fstr_wrk_thr_t::create_physical_table(){
-    DBUG_ENTER("fstr_wrk_thr::create_physical_table");
-    ddl_request_t* r = static_cast<ddl_request_t*>(req);
-    // Add entry on catalog
+>>>>>>> foster_rework
+
+w_rc_t fstr_wrk_thr_t::create_physical_table(ddl_request_t* r){
     StoreID cat_stid =1;
-    //Fill an idx_name buffer with tablename and idx name
-    uchar separator[4]={"###"};
-
-    uchar* idx_name_buf= (uchar*) my_malloc(r->table_name.length() + r->max_key_name_len + 3, MYF(MY_WME));
-    for(int i=0; i<r->table->s->keys; i++){
-
-        memcpy(idx_name_buf, r->table_name.ptr(), r->table_name.length());
-
-        idx_name_buf +=r->table_name.length();
-        memcpy(idx_name_buf, separator, 3);
-        idx_name_buf+=3;
-
-        memcpy(idx_name_buf, r->table->key_info[i].name, r->table->key_info[i].name_length);
-        idx_name_buf -= (r->table_name.length()+3);
-        StoreID stid_tmp;
-        //Create new index
-        W_COERCE(foster_handle->create_index(stid_tmp));
-        //Construct a key
-        w_keystr_t kstr;
-        kstr.construct_regularkey(idx_name_buf,r->table_name.length()+r->table->key_info[i].name_length+3);
-        //Create assoc in catalog
-        W_COERCE(foster_handle->create_assoc(cat_stid, kstr, vec_t(&stid_tmp, sizeof(StoreID))));
+    StoreID primary_stid;
+    //Create the primary index
+    W_COERCE(foster_handle->create_index(primary_stid));
+    //Create Primary Key String from name of the database and table_name
+    w_keystr_t cat_entry_key = construct_cat_key(r->capnpTable.getDbname().asString(),
+                                        r->capnpTable.getTablename().asString());
+    ::capnp::List<FosterIndexInfo>::Builder indexes = r->capnpTable.getIndexes();
+    FosterIndexInfo::Builder primary_idx = indexes[0];
+    primary_idx.setStid(primary_stid);
+    primary_idx.setPrimary(primary_stid);
+    for(uint i=1; i<indexes.size(); i++){
+        StoreID sec_stid;
+        W_COERCE(foster_handle->create_index(sec_stid));
+        FosterIndexInfo::Builder curr_index = indexes[i];
+        curr_index.setStid(sec_stid);
+        curr_index.setPrimary(primary_stid);
     }
-    W_COERCE(foster_handle->commit_xct());
-    DBUG_RETURN(RCOK);
-}
+
+    if(!r->foreign_keys.empty()) {
+        ::capnp::List<FosterForeignTable>::Builder foreignKeys = r->capnpTable.initForeignkeys(
+                r->foreign_keys.size());
+        std::list<FOSTER_FK_INFO>::iterator fk_iterator;
+        for(uint i=0; i<r->foreign_keys.size(); i++){
+            FosterForeignTable::Builder proto_curr_fk = foreignKeys[i];
+            FOSTER_FK_INFO* curr_fk_req= &r->foreign_keys.at(i);
+            proto_curr_fk.setId(curr_fk_req->foreign_id);
+            w_keystr_t ref_keystr = construct_cat_key(curr_fk_req->referenced_db,
+                                                   curr_fk_req->referenced_table);
+            proto_curr_fk.setForeignTableId((char*) ref_keystr.serialize_as_nonkeystr().c_str());
+
+            bool found;
+            smsize_t ref_buf_size=1;
+            capnp::word *ref_buf = (capnp::word*) malloc(ref_buf_size);
+            w_rc_t err;
+            err = ss_m::find_assoc(cat_stid, ref_keystr, ref_buf, ref_buf_size, found);
+            if(!found) continue; //TODO errmsg -> referenced table not found
+            if(err.is_error() && err.err_num() == eRECWONTFIT){
+                ref_buf= (capnp::word*) realloc(ref_buf, ref_buf_size);
+                ss_m::find_assoc(cat_stid, ref_keystr, ref_buf, ref_buf_size, found);
+            }
+            kj::ArrayPtr<const capnp::word> ptr= kj::arrayPtr(reinterpret_cast<const capnp::word*>(ref_buf),
+                                                              ref_buf_size/ sizeof(capnp::word));
+            capnp::FlatArrayMessageReader refreader(ptr);
+            FosterTableInfo::Reader refTableInfo = refreader.getRoot<FosterTableInfo>();
+            if(found){
+                uint fk_index_pos;
+                string fk_index_name;
+                uint ref_index_pos;
+                string ref_index_name;
+                uint ref_stid;
+
+                proto_curr_fk.setForeignTableId((char*) ref_keystr.serialize_as_nonkeystr().c_str());
+                capnp::List<FosterIndexInfo>::Reader refindexes = refTableInfo.getIndexes();
 
 
-w_rc_t fstr_wrk_thr_t::delete_table() {
-    ddl_request_t* r = static_cast<ddl_request_t*>(req);
-    StoreID cat_stid =1;
-    uchar separator[4]={"###"};
-    w_keystr_t table_keystr;
-    table_keystr.construct_regularkey(r->table_name.ptr(), r->table_name.length());
-    w_keystr_t infimum, supremum;
-    infimum.construct_posinfkey();
-    supremum.construct_neginfkey();
-    bt_cursor_t* catalog_cursor = new bt_cursor_t(cat_stid, supremum, false, infimum, false, true);
-    catalog_cursor->next();
-    w_keystr_t curr;
-    do{
-        curr= catalog_cursor->key();
-        basic_string<unsigned char> data= curr.serialize_as_nonkeystr();
-        basic_string<unsigned char> separator_str =basic_string<unsigned char> (separator, 3);
+                //Find referenced index
+                for(uint curr_ref_idx=0; curr_ref_idx<refindexes.size();curr_ref_idx++){
+                    FosterIndexInfo::Reader curr_index = refindexes[curr_ref_idx];
+                    if(curr_fk_req->referenced_fields.size()!=
+                            curr_index.getPartinfo().size()) continue;
+                    bool fk_index_found= true;
+                    capnp::List<FosterFieldInfo>::Reader refparts = curr_index.getPartinfo();
+                    for(uint j=0; j<refparts.size(); j++){
+                        FosterFieldInfo::Reader curr_part = refparts[j];
+                        if(strcmp(curr_part.getFieldname().cStr(),curr_fk_req->referenced_fields.at(j).c_str())!=0){
+                            fk_index_found=false;
+                            break;
+                        }
+                    }
+                    if(fk_index_found){
+                        ref_index_pos=curr_ref_idx;
+                        ref_index_name=curr_index.getIndexname();
+                        ref_stid = curr_index.getStid();
+                        break;
+                    }
+                }
+                //Find foreign index
+                for(uint curr_foreign_idx=0; curr_foreign_idx<indexes.size();curr_foreign_idx++){
+                    FosterIndexInfo::Reader curr_index = indexes[curr_foreign_idx];
+                    if(curr_fk_req->foreign_fields.size()!=
+                       curr_index.getPartinfo().size()) continue;
+                    bool fk_index_found= true;
+                    capnp::List<FosterFieldInfo>::Reader parts = curr_index.getPartinfo();
+                    for(uint j=0; j<parts.size(); j++){
+                        FosterFieldInfo::Reader curr_part = parts[j];
+                        if(strcmp(curr_part.getFieldname().cStr(), curr_fk_req->foreign_fields.at(j).c_str())!=0){
+                            fk_index_found=false;
+                            break;
+                        }
+                    }
+                    if(fk_index_found){
+                        fk_index_pos=curr_foreign_idx;
+                        fk_index_name=curr_index.getIndexname();
+                        break;
+                    }
+                }
 
-        //Drop every catalog entry with the same table name
-        if(data.compare(0,r->table_name.length()-1,table_keystr.serialize_as_nonkeystr(), 0,r->table_name.length()-1)){
-            if(data.compare(r->table_name.length(),3,separator_str,0,3)){
-                //foster_handle->destroy_assoc(cat_stid,curr);
+                //Build new foreign data
+                proto_curr_fk.setForeignIdx(fk_index_name);
+                proto_curr_fk.setForeignIdxPos(fk_index_pos);
+                proto_curr_fk.setReferencingIdxPos(ref_index_pos);
+                proto_curr_fk.setReferencingIdx(ref_index_name);
+                proto_curr_fk.setReferencingStid(ref_stid);
+                //Build new referencing data
+                uint insert_pos;
+                capnp::MallocMessageBuilder mo;
+                ::capnp::initMessageBuilderFromFlatArrayCopy(ptr, mo);
+                FosterTableInfo::Builder refTable_new = mo.getRoot<FosterTableInfo>();
+                if(refTableInfo.hasReferencingKeys()) {
+                    ::capnp::Orphan< ::capnp::List<::FosterReferencingTable>> old_refRef= refTable_new.disownReferencingKeys();
+                    ::capnp::List<FosterReferencingTable>::Reader old_refRefList= old_refRef.get();
+                    capnp::List<FosterReferencingTable>::Builder refReferencing = refTable_new.initReferencingKeys(
+                            old_refRefList.size() + 1);
+                    for (uint k = 0; k < old_refRefList.size(); k++) {
+                        FosterReferencingTable::Reader copy_ref_reader = old_refRefList[k];
+                        FosterReferencingTable::Builder copy_ref_builder = refReferencing[k];
+                        copy_ref_builder.setReferencingTable(copy_ref_reader.getReferencingTable());
+                        copy_ref_builder.setReferencingIdx(copy_ref_reader.getReferencingIdx());
+                        copy_ref_builder.setReferencingIdxPos(copy_ref_reader.getReferencingIdxPos());
+                        copy_ref_builder.setForeignIdxPos(copy_ref_reader.getForeignIdxPos());
+                        copy_ref_builder.setForeignIdx(copy_ref_reader.getForeignIdx());
+                        copy_ref_builder.setId(copy_ref_reader.getId());
+                        copy_ref_builder.setAction(copy_ref_reader.getAction());
+                        copy_ref_builder.setType(copy_ref_reader.getType());
+                    }
+                    insert_pos= old_refRefList.size()+1;
+                }else{
+                    insert_pos=1;
+                    refTable_new.initReferencingKeys(1);
+                }
+                capnp::List<FosterReferencingTable>::Builder refReferencing = refTable_new.getReferencingKeys();
+                FosterReferencingTable::Builder proto_curr_refRef = refReferencing[insert_pos-1];
+                proto_curr_refRef.setReferencingTable((char*) cat_entry_key.serialize_as_nonkeystr().c_str());
+                proto_curr_refRef.setReferencingIdx(ref_index_name);
+                proto_curr_refRef.setReferencingIdxPos(ref_index_pos);
+                proto_curr_refRef.setForeignIdxPos(fk_index_pos);
+                proto_curr_refRef.setForeignIdx(fk_index_name);
+                proto_curr_refRef.setId(curr_fk_req->foreign_id);
+                switch(curr_fk_req->delete_method) {
+                    case 1: proto_curr_refRef.setType(FosterReferencingTable::Type::DELETE);
+                        proto_curr_refRef.setAction(FosterReferencingTable::Action::CASCADE);break;
+                    case 2: proto_curr_refRef.setType(FosterReferencingTable::Type::DELETE);
+                        proto_curr_refRef.setAction(FosterReferencingTable::Action::RESTRICT);break;
+                    case 3: proto_curr_refRef.setType(FosterReferencingTable::Type::DELETE);
+                        proto_curr_refRef.setAction(FosterReferencingTable::Action::SETNULL);break;
+                    case 4: proto_curr_refRef.setType(FosterReferencingTable::Type::DELETE);
+                        proto_curr_refRef.setAction(FosterReferencingTable::Action::NOACTION);break;
+                    default: break;
+                }
+                switch(curr_fk_req->update_method) {
+                    case 1: proto_curr_refRef.setType(FosterReferencingTable::Type::UPDATE);
+                        proto_curr_refRef.setAction(FosterReferencingTable::Action::CASCADE);break;
+                    case 2: proto_curr_refRef.setType(FosterReferencingTable::Type::UPDATE);
+                        proto_curr_refRef.setAction(FosterReferencingTable::Action::RESTRICT);break;
+                    case 3: proto_curr_refRef.setType(FosterReferencingTable::Type::UPDATE);
+                        proto_curr_refRef.setAction(FosterReferencingTable::Action::SETNULL);break;
+                    case 4: proto_curr_refRef.setType(FosterReferencingTable::Type::UPDATE);
+                        proto_curr_refRef.setAction(FosterReferencingTable::Action::NOACTION);break;
+                    default: break;
+                }
+                kj::Array<capnp::word> ref_words = messageToFlatArray(mo);
+                kj::ArrayPtr<kj::byte> ref_bytes = ref_words.asBytes();
+                kj::ArrayPtr<const capnp::word> refTableArrayPtr= kj::arrayPtr(reinterpret_cast<const capnp::word*>(ref_bytes.begin()),
+                                                                   ref_bytes.size() / sizeof(capnp::word));
+                err =foster_handle->put_assoc(cat_stid, ref_keystr,
+                                              vec_t(ref_bytes.begin(),ref_bytes.size()));
+                curr_fk_req->reftables = kj::mv(refTableArrayPtr);
             }
         }
-        catalog_cursor->next();
-    }while(!catalog_cursor->eof());
-    return RCOK;
+    }
+    w_rc_t err;
+    kj::Array<capnp::word> words = messageToFlatArray(r->message);
+    kj::ArrayPtr<kj::byte> bytes = words.asBytes();
+//    print_capnp_table(r->capnpTable);
+    err =foster_handle->create_assoc(cat_stid, cat_entry_key,
+                                         vec_t(bytes.begin(),bytes.size()));
+    err= foster_handle->commit_xct();
+    return err;
 }
 
 
+w_rc_t fstr_wrk_thr_t::discover_table(discovery_request_t* r)
+{
+    w_keystr_t cat_entry_key = construct_cat_key(r->db_name, r->table_name);
+    StoreID cat_stid =1;
+    bool found;
+    smsize_t size=1;
+    capnp::word *buf = (capnp::word*) malloc(size);
+    w_rc_t err;
+    err = ss_m::find_assoc(cat_stid, cat_entry_key, buf, size, found);
+    if(!found) return RC(eINTERNAL);
+    if(err.is_error() && err.err_num() == eRECWONTFIT){
+        buf= (capnp::word*) realloc(buf, size);
+        ss_m::find_assoc(cat_stid, cat_entry_key, buf, size, found);
+    }
+    kj::ArrayPtr<const capnp::word> table_array_ptr= kj::arrayPtr(
+                reinterpret_cast<const capnp::word*>(buf),
+                                                           size/ sizeof(capnp::word));
+    r->table_info_array = kj::mv(table_array_ptr);
+    return RCOK;
+}
 
-w_rc_t fstr_wrk_thr_t::add_tuple(){
+w_rc_t fstr_wrk_thr_t::delete_table(ddl_request_t* r) {
+    StoreID cat_stid =1;
+    w_keystr_t cat_entry = construct_cat_key(r->db_name, r->table_name);
+    w_rc_t err =foster_handle->destroy_assoc(cat_stid,cat_entry);
+    err= foster_commit();
+    return err;
+}
+
+#include <btree.h>
+
+w_rc_t fstr_wrk_thr_t::add_tuple(write_request_t* r){
     w_rc_t rc = RCOK;
-    write_request_t* r = static_cast<write_request_t*>(req);
-    // build key dat
-    w_keystr_t kstr;
-    //Construct primary key of tuple in _key_buf
-    int ksz = extract_key(r->key_buf, 0, r->mysql_format_buf, r->table);
-    kstr.construct_regularkey(r->key_buf, ksz);
-    //Load stid of the primary idx
-    StoreID pkstid = r->stids.at(0);
-    uint rec_buf_len =(uint) pack_row(r->mysql_format_buf, r->table, r->rec_buf);
-    //create assoc in primary index
-    rc=foster_handle->create_assoc(pkstid, kstr, vec_t(r->rec_buf, rec_buf_len));
+    if(r->table_info_array.size()==0) return RC(eINTERNAL);
+    capnp::FlatArrayMessageReader fareader(r->table_info_array);
+    FosterTableInfo::Reader table_reader = fareader.getRoot<FosterTableInfo>();
+    capnp::List<FosterIndexInfo>::Reader indexes = table_reader.getIndexes();
+    capnp::List<FosterForeignTable>::Reader foreign_keys= table_reader.getForeignkeys();
+    if(foreign_keys.size()>0){
+        StoreID cat_stid=1;
+        for(uint i=0; i< foreign_keys.size(); i++ ) {
+            FosterForeignTable::Reader curr_foreign = foreign_keys[i];
+            StoreID ref_stid= curr_foreign.getReferencingStid();
+            FosterIndexInfo::Reader foreignIdx = indexes[curr_foreign.getForeignIdxPos()];
+            w_keystr_t foreign_kstr=foster_key_copy(r->key_buf, r->mysql_format_buf, &foreignIdx);
+            w_keystr_t infimum;
+            infimum.construct_posinfkey();
+            bt_cursor_t* ref_cursor = new bt_cursor_t(ref_stid,
+                                                      foreign_kstr,
+                                                          true,
+                                                          infimum,
+                                                          false,
+                                                          true);
+            W_COERCE(ref_cursor->next());
+            if(ref_cursor->eof()) return RC(fcNOTIMPLEMENTED);
+            int d = memcmp(foreign_kstr.buffer_as_keystr(),
+                           ref_cursor->key().buffer_as_keystr(),
+                           foreign_kstr.get_length_as_keystr());
+            if(d!=0) return RC(fcNOTIMPLEMENTED); //TODO better error codes
+        }
+    }
+
+    for(int i=0; i<indexes.size();i++){
+        PageID root_pid;
+        FosterIndexInfo::Reader index = indexes[i];
+        foster_handle->open_store(index.getStid(),root_pid,true);
+    }
+    FosterIndexInfo::Reader primaryIdx = table_reader.getIndexes()[0];
+    StoreID pkstid = table_reader.getIndexes()[0].getStid();
+    w_keystr_t kstr=foster_key_copy(r->key_buf, r->mysql_format_buf, &primaryIdx);
+    //create assoc in primary
+    rc=foster_handle->bt->insert(pkstid, kstr, vec_t(r->packed_record_buf, r->packed_len));
+
     if(rc.is_error()) { return rc;}
-
-    if(r->stids.size()>1){
-        uchar* sec_key_buffer = (uchar *) my_malloc(r->max_key_len, MYF(MY_WME));
-        for (int idx = 1; idx < r->stids.size(); idx++) {
-            StoreID sec_idx_stid = r->stids.at(idx);
-            int sec_ksz = extract_key(sec_key_buffer, idx, r->mysql_format_buf, r->table);
-            w_keystr_t sec_kstr;
-            sec_kstr.construct_regularkey(sec_key_buffer, sec_ksz);
-            add_to_secondary_idx(sec_idx_stid,sec_kstr,kstr);
+    if(table_reader.getIndexes().size()>1){
+        ::capnp::List<FosterIndexInfo>::Reader indexes = table_reader.getIndexes();
+        for (uint idx = 1; idx < indexes.size(); idx++) {
+            FosterIndexInfo::Reader curr_index = indexes[idx];
+            StoreID sec_idx_stid = curr_index.getStid();
+            w_keystr_t sec_kstr=foster_key_copy(r->key_buf, r->mysql_format_buf, &curr_index);
+            add_to_secondary_idx_uniquified(sec_idx_stid, sec_kstr, kstr);
         }
     }
     return (rc);
 }
 
-w_rc_t fstr_wrk_thr_t::update_tuple(){
+w_rc_t fstr_wrk_thr_t::update_tuple(write_request_t* r){
+    w_rc_t rc;
+    if(r->table_info_array.size()==0) return RC(eINTERNAL);
+    capnp::FlatArrayMessageReader fareader(r->table_info_array);
+    FosterTableInfo::Reader table_reader = fareader.getRoot<FosterTableInfo>();
     bool changed_pk=false;
-    write_request_t* r = static_cast<write_request_t*>(req);
-    StoreID pk_stid = r->stids.at(0);
-    w_keystr_t new_kstr;
-    int ksz = extract_key(r->key_buf, 0, r->mysql_format_buf, r->table);
-    new_kstr.construct_regularkey(r->key_buf, ksz);
-    uint rec_buf_len =(uint) pack_row(r->mysql_format_buf, r->table, r->rec_buf);
-    W_DO(foster_handle->put_assoc(pk_stid,new_kstr,vec_t(r->rec_buf, rec_buf_len)));
-
-    uchar* old_key_buffer;
-    old_key_buffer = (uchar*) my_malloc(r->table->s->key_info[0].key_part->length, MYF(MY_WME));
-    uint key_offset= r->table->s->key_info[0].key_part->offset;
-    memcpy(old_key_buffer, r->old_mysql_format_buf+key_offset, r->table->s->key_info[0].key_part->length);
-
-    //Build old key data of primary key
-    w_keystr_t old_kstr;
-    old_kstr.construct_regularkey(old_key_buffer, r->table->s->key_info[0].key_part->length);
-
-    if(old_kstr.compare(new_kstr)!=0){
-        W_DO(foster_handle->destroy_assoc(pk_stid, old_kstr));
-        changed_pk=true;
-    }
-
-    if(r->stids.size()>1){
-        uchar* sec_key_buffer = (uchar *) my_malloc(r->max_key_len, MYF(MY_WME));
-        uchar* old_sec_key_buffer;
-        for (int idx = 1; idx < r->stids.size(); idx++) {
-            StoreID sec_idx_stid = r->stids.at(idx);
-
-            int sec_ksz = extract_key(sec_key_buffer, idx, r->mysql_format_buf, r->table);
-
-            w_keystr_t sec_kstr, old_sec_kstr;
-
-            old_sec_key_buffer = (uchar*) my_malloc(r->table->s->key_info[idx].key_part->length, MYF(MY_WME));
-            uint key_offset= r->table->s->key_info[0].key_part->offset;
-            memcpy(old_key_buffer, r->old_mysql_format_buf+key_offset, r->table->s->key_info[0].key_part->length);
-            old_sec_kstr.construct_regularkey(old_sec_key_buffer, r->table->s->key_info[idx].key_part->length);
-            sec_kstr.construct_regularkey(sec_key_buffer, sec_ksz);
-            add_to_secondary_idx(sec_idx_stid,sec_kstr,new_kstr);
-            if(changed_pk) delete_from_secondary_idx(sec_idx_stid,sec_kstr, old_kstr);
+    capnp::List<FosterIndexInfo>::Reader indexes = table_reader.getIndexes();
+    capnp::List<FosterForeignTable>::Reader foreign_keys= table_reader.getForeignkeys();
+    if(foreign_keys.size()>0){
+        StoreID cat_stid=1;
+        for(uint i=0; i< foreign_keys.size(); i++ ) {
+            FosterForeignTable::Reader curr_foreign = foreign_keys[i];
+            StoreID ref_stid= curr_foreign.getReferencingStid();
+            FosterIndexInfo::Reader foreignIdx = indexes[curr_foreign.getForeignIdxPos()];
+            w_keystr_t foreign_kstr=foster_key_copy(r->key_buf, r->mysql_format_buf, &foreignIdx);
+            w_keystr_t infimum;
+            infimum.construct_posinfkey();
+            bt_cursor_t* ref_cursor = new bt_cursor_t(ref_stid,
+                                                      foreign_kstr,
+                                                      true,
+                                                      infimum,
+                                                      false,
+                                                      true);
+            W_COERCE(ref_cursor->next());
+            if(ref_cursor->eof()) return RC(fcNOTIMPLEMENTED);
+            int d = memcmp(foreign_kstr.buffer_as_keystr(),
+                           ref_cursor->key().buffer_as_keystr(),
+                           foreign_kstr.get_length_as_keystr());
+            if(d!=0) return RC(fcNOTIMPLEMENTED); //TODO better error codes
         }
     }
-    return RCOK;
+
+    for(int i=0; i<indexes.size();i++){
+        PageID root_pid;
+        FosterIndexInfo::Reader index = indexes[i];
+        foster_handle->open_store(index.getStid(),root_pid,true);
+    }
+    FosterIndexInfo::Reader primaryIdx = table_reader.getIndexes()[0];
+
+    StoreID pkstid = table_reader.getIndexes()[0].getStid();
+    w_keystr_t new_pk_kstr=foster_key_copy(r->key_buf, r->mysql_format_buf, &primaryIdx);
+    w_keystr_t old_pk_kstr=foster_key_copy(r->key_buf, r->old_mysql_format_buf, &primaryIdx);
+
+    if(old_pk_kstr.compare(new_pk_kstr)!=0){
+        rc=foster_handle->bt->insert(pkstid, new_pk_kstr, vec_t(r->packed_record_buf, r->packed_len));
+        rc=foster_handle->bt->remove(pkstid, old_pk_kstr);
+        changed_pk=true;
+    }else{
+        rc=foster_handle->bt->put(pkstid,new_pk_kstr, vec_t(r->packed_record_buf, r->packed_len));
+    }
+    if(indexes.size()>1){
+        bool changed_sec=false;
+        for (uint idx = 1; idx < indexes.size(); idx++) {
+            FosterIndexInfo::Reader curr_index= indexes[idx];
+            StoreID sec_idx_stid = curr_index.getStid();
+            w_keystr_t new_sec_kstr= foster_key_copy(r->key_buf, r->mysql_format_buf, &curr_index);
+            w_keystr_t old_sec_kstr= foster_key_copy(r->key_buf, r->old_mysql_format_buf, &curr_index);
+           if(old_sec_kstr.compare(new_sec_kstr)!=0){
+                changed_sec=true;
+            }
+            if(changed_pk || changed_sec){
+//                delete_from_secondary_idx(sec_idx_stid,old_sec_kstr, old_pk_kstr);
+//                add_to_secondary_idx(sec_idx_stid,new_sec_kstr,new_pk_kstr);
+
+                delete_from_secondary_idx_uniquified(sec_idx_stid, old_sec_kstr, old_pk_kstr);
+                add_to_secondary_idx_uniquified(sec_idx_stid,new_sec_kstr, new_pk_kstr);
+            }
+        }
+    }
+    return rc;
 }
 
-w_rc_t fstr_wrk_thr_t::delete_tuple(){
-    w_rc_t rc = RCOK;
-    write_request_t* r = static_cast<write_request_t*>(req);
-    // build key dat
-    w_keystr_t kstr;
-    //Construct primary key of tuple in _key_buf
-    int ksz = extract_key(r->key_buf, 0, r->mysql_format_buf, r->table);
-    kstr.construct_regularkey(r->key_buf, ksz);
-    //Load stid of the primary idx
-    StoreID pk_stid = r->stids.at(0);
-    //create assoc in primary index
-    rc=ss_m::destroy_assoc(pk_stid,kstr);
-    if(r->stids.size()>1){
-        uchar* sec_key_buffer = (uchar *) my_malloc(r->max_key_len, MYF(MY_WME));
-        for (int idx = 1; idx < r->stids.size(); idx++) {
-            StoreID sec_idx_stid = r->stids.at(idx);
-            int sec_ksz = extract_key(sec_key_buffer, idx, r->mysql_format_buf, r->table);
-            w_keystr_t sec_kstr;
-            sec_kstr.construct_regularkey(sec_key_buffer, sec_ksz);
-            delete_from_secondary_idx(sec_idx_stid,sec_kstr, kstr);
+w_rc_t fstr_wrk_thr_t::delete_tuple(write_request_t* r){
+    if(r->table_info_array.size()==0) return RC(eINTERNAL);
+    capnp::FlatArrayMessageReader fareader(r->table_info_array);
+    FosterTableInfo::Reader table_reader = fareader.getRoot<FosterTableInfo>();
+    w_rc_t rc;
+    FosterIndexInfo::Reader primaryIdx = table_reader.getIndexes()[0];
+    capnp::List<FosterIndexInfo>::Reader indexes = table_reader.getIndexes();
+    for(int i=0; i<indexes.size();i++){
+        PageID root_pid;
+        FosterIndexInfo::Reader index = indexes[i];
+        rc=foster_handle->open_store(index.getStid(),root_pid,true);
+    }
+    w_keystr_t primary_kstr=foster_key_copy(r->key_buf, r->mysql_format_buf, &primaryIdx);
+    rc=foster_handle->bt->remove(indexes[0].getStid(), primary_kstr);
+    if(indexes.size()>1){
+        for (uint idx = 1; idx < indexes.size(); idx++) {
+            FosterIndexInfo::Reader curr_index= indexes[idx];
+            w_keystr_t sec_kstr= foster_key_copy(r->key_buf, r->mysql_format_buf, &curr_index);
+            StoreID sec_idx_stid = curr_index.getStid();
+//            delete_from_secondary_idx(sec_idx_stid,sec_kstr, primary_kstr);
+
+            delete_from_secondary_idx_uniquified(sec_idx_stid, sec_kstr, primary_kstr);
+        }
+    }
+    //TODO open all stores of referenced tables
+    capnp::List<FosterReferencingTable>::Reader ref_keys= table_reader.getReferencingKeys();
+    if(ref_keys.size()>0){
+        StoreID cat_stid=1;
+        for(uint i=0; i< ref_keys.size(); i++ ){
+            FosterReferencingTable::Reader curr_ref = ref_keys[i];
+            if(curr_ref.getType()==FosterReferencingTable::Type::DELETE) {
+                FosterIndexInfo::Reader referenced_idx = table_reader.getIndexes()[curr_ref.getReferencingIdxPos()];
+                smsize_t fktable_cat_sz=1;
+                //Get information about the referencing (i.e. foreign) table from the catalog
+                w_keystr_t fktable_cat_keystr;
+                fktable_cat_keystr.construct_regularkey(curr_ref.getReferencingTable().cStr(), curr_ref.getReferencingTable().size());
+                bool found;
+                capnp::word *ref_buf = (capnp::word *) malloc(fktable_cat_sz);
+                w_rc_t err;
+                err = ss_m::find_assoc(cat_stid, fktable_cat_keystr, ref_buf, fktable_cat_sz, found);
+                if(!found) continue; //TODO errmsg missing foreign table
+                if (err.is_error() && err.err_num() == eRECWONTFIT) {
+                    ref_buf = (capnp::word *) realloc(ref_buf, fktable_cat_sz);
+                    ss_m::find_assoc(cat_stid, fktable_cat_keystr, ref_buf, fktable_cat_sz, found);
+                }
+                kj::ArrayPtr<const capnp::word> foreignTable_Array =
+                        kj::arrayPtr(reinterpret_cast<const capnp::word *>(ref_buf),
+                                                                                  fktable_cat_sz / sizeof(capnp::word));
+                capnp::FlatArrayMessageReader refreader(foreignTable_Array);
+                FosterTableInfo::Reader foreignTableInfo = refreader.getRoot<FosterTableInfo>();
+
+                //Get Primary Keys from the secondary idx that is the foreign idx
+                FosterIndexInfo::Reader foreign_idx =
+                        foreignTableInfo.getIndexes()[curr_ref.getForeignIdxPos()];
+
+                //Get the foreign key that needs to be deleted from the referenced idx
+                w_keystr_t foreign_key_kstr=
+                        foster_key_copy(r->key_buf, r->mysql_format_buf, &referenced_idx);
+                w_keystr_t infimum;
+                infimum.construct_posinfkey();
+                bt_cursor_t* foreign_cursor = new bt_cursor_t(foreign_idx.getStid(),
+                                                             foreign_key_kstr,
+                                                             true,
+                                                             infimum,
+                                                             false,
+                                                             true);
+
+//                smsize_t foreign_sec_tuple_sz = 1;
+//                uchar *foreign_sec_tuple = (uchar *) malloc(foreign_sec_tuple_sz);
+//                err = ss_m::find_assoc(foreign_idx.getStid(), foreign_key_kstr,
+//                                       foreign_sec_tuple, foreign_sec_tuple_sz, found);
+//                if(!found) continue; //TODO errmsg corrupted foreign idx
+//                if (err.is_error() && err.err_num() == eRECWONTFIT) {
+//                    ref_buf = (capnp::word *) realloc(foreign_sec_tuple, foreign_sec_tuple_sz);
+//                    ss_m::find_assoc(foreign_idx.getStid(),
+//                                     foreign_key_kstr, foreign_sec_tuple, foreign_sec_tuple_sz, found);
+//                }
+                W_COERCE(foreign_cursor->next());
+                if(foreign_cursor->eof()) continue; //TODO errmsg corrupted foreign idx
+                int d = memcmp(foreign_key_kstr.buffer_as_keystr(),
+                               foreign_cursor->key().buffer_as_keystr(),
+                               foreign_key_kstr.get_length_as_keystr());
+
+                FosterIndexInfo::Reader foreign_primary_idx = foreignTableInfo.getIndexes()[0];
+                smsize_t foreign_tuple_sz=1;
+                uchar* foreign_tuple_buf= (uchar*) malloc(foreign_tuple_sz);
+
+                while(d==0){
+                    w_keystr_t curr_foreign_primary_kstr;
+                    curr_foreign_primary_kstr.construct_regularkey(foreign_cursor->elem(),
+                                                                   foreign_cursor->elen());
+                    err = ss_m::find_assoc(foreign_primary_idx.getStid(),
+                                           curr_foreign_primary_kstr, foreign_tuple_buf,
+                                           foreign_tuple_sz, found);
+                    if (err.is_error() && err.err_num() == eRECWONTFIT) {
+                        foreign_tuple_buf = (uchar*) realloc(foreign_tuple_buf, foreign_tuple_sz);
+                        err = ss_m::find_assoc(foreign_primary_idx.getStid(), curr_foreign_primary_kstr,
+                                               foreign_tuple_buf, foreign_tuple_sz, found);
+                    }
+
+                    if(found){
+                        switch(curr_ref.getAction()){
+                            case capnp::schemas::Action_df51f652b4df6b49::CASCADE: {
+                                write_request_t *delete_foreign_req = new write_request_t();
+                                delete_foreign_req->mysql_format_buf = foreign_tuple_buf;
+                                delete_foreign_req->key_buf = r->key_buf;
+                                delete_foreign_req->table_info_array = foreignTable_Array;
+                                delete_tuple(delete_foreign_req);
+                                break;
+                            }
+                            case capnp::schemas::Action_df51f652b4df6b49::RESTRICT:
+                                return RC(fcNOTIMPLEMENTED); break;
+                            case capnp::schemas::Action_df51f652b4df6b49::NOACTION:break;
+                            case capnp::schemas::Action_df51f652b4df6b49::SETDEFAULT:break;
+                            case capnp::schemas::Action_df51f652b4df6b49::SETNULL:break;
+                        }
+                    }
+
+                    W_COERCE(foreign_cursor->next());
+                    if(foreign_cursor->eof()) break;
+                    d = memcmp(foreign_key_kstr.buffer_as_keystr(),
+                                   foreign_cursor->key().buffer_as_keystr(),
+                                   foreign_key_kstr.get_length_as_keystr());
+                }
+
+//                uint numberOfRecs= foreign_sec_tuple[0];
+//                for(uchar* pos=++foreign_sec_tuple;
+//                    pos< (foreign_sec_tuple +foreign_sec_tuple_sz);
+//                    pos+= foreign_primary_idx.getKeylength()){
+//                    w_keystr_t curr_foreign_primary_kstr;
+//                    curr_foreign_primary_kstr.construct_regularkey(pos, foreign_primary_idx.getKeylength());
+//
+//
+//                }
+                free(foreign_tuple_buf);
+            }
+
         }
     }
     return (rc);
@@ -433,8 +723,10 @@ w_rc_t fstr_wrk_thr_t::delete_tuple(){
 
 
 
-w_rc_t fstr_wrk_thr_t::index_probe(){
-    read_request_t* r = static_cast<read_request_t*>(req);
+w_rc_t fstr_wrk_thr_t::index_probe(read_request_t* r){
+    if(r->table_info_array.size()==0) return RC(eINTERNAL);
+    capnp::FlatArrayMessageReader fareader(r->table_info_array);
+    FosterTableInfo::Reader table_reader = fareader.getRoot<FosterTableInfo>();
     //Infimum and supremum for use in cursors
     w_keystr_t infimum, supremum;
     infimum.construct_posinfkey();
@@ -444,91 +736,129 @@ w_rc_t fstr_wrk_thr_t::index_probe(){
 
     bool partial =false;
     //Construct key of tuple in _key_b
+    capnp::List<FosterIndexInfo>::Reader indexes = table_reader.getIndexes();
+    FosterIndexInfo::Reader primaryIdxInfo = indexes[0];
     if(r->ksz!=0){
-        kstr.construct_regularkey(r->key_buf, r->ksz);
-        if(r->ksz <r->table->key_info[r->idx_no].key_length) {
+            kstr.construct_regularkey(r->key_buf, r->ksz);
+        if(r->ksz <indexes[r->idx_no].getKeylength()) {
             partial = true;
             //Null bit set
             if (r->key_buf[0] != 0) kstr.construct_neginfkey();
         }
+        PageID root;
+        foster_handle->open_store(indexes[0].getStid(), root, true);
     }else{
-        r->find_flag==HA_READ_PREFIX_LAST ? kstr.construct_posinfkey() : kstr.construct_neginfkey();
+        r->find_flag==PREFIX_LAST ? kstr.construct_posinfkey() : kstr.construct_neginfkey();
     }
 
-    StoreID idx_stid = r->stid;
+    StoreID idx_stid = indexes[r->idx_no].getStid();
     //Switch on search modes
     switch (r->find_flag) {
-        case HA_READ_KEY_OR_NEXT:
+        case KEY_OR_NEXT:
             cursor = new bt_cursor_t(idx_stid, kstr, true, infimum, false, true);
             W_COERCE(cursor->next());
             if (cursor->eof()) {
                 return RC(se_TUPLE_NOT_FOUND);
             }
             break;
-        case HA_READ_KEY_OR_PREV:
+        case KEY_OR_PREV:
             cursor = new bt_cursor_t(idx_stid, supremum, true, kstr, false, false);
             W_COERCE(cursor->next());
             if (cursor->eof()) {
                 return RC(se_TUPLE_NOT_FOUND);
             }
             break;
-        case HA_READ_KEY_EXACT: {
+        case KEY_EXACT: {
+            _find_exact=true;
             cursor = new bt_cursor_t(idx_stid, kstr, true, infimum, false, true);
             W_COERCE(cursor->next());
-            int comp = kstr.compare(cursor->key());
-            if (comp < 0) {
-                if(!partial) return RC(se_TUPLE_NOT_FOUND);
+            if(!cursor->eof()){
+                int d= memcmp(kstr.buffer_as_keystr(),cursor->key().buffer_as_keystr(),
+                       kstr.get_length_as_keystr());
+                if (d==0) {
+                    if(r->idx_no==0 &&
+                            kstr.get_length_as_keystr()!= cursor->key().get_length_as_keystr())
+                        return RC(se_TUPLE_NOT_FOUND);
+                }else{
+                    return RC(se_TUPLE_NOT_FOUND);
+                }
+            }else{
+                return RC(se_TUPLE_NOT_FOUND);
             }
         }
             break;
-        case HA_READ_AFTER_KEY:
+        case AFTER_KEY: {
             cursor = new bt_cursor_t(idx_stid, kstr, false, infimum, false, true);
             W_COERCE(cursor->next());
             if (cursor->eof()) {
                 return RC(se_TUPLE_NOT_FOUND);
             }
+            int d = memcmp(kstr.buffer_as_keystr(), cursor->key().buffer_as_keystr(),
+                           kstr.get_length_as_keystr());
+            while (d == 0 && !cursor->eof()) {
+                W_COERCE(cursor->next());
+                d = memcmp(kstr.buffer_as_keystr(), cursor->key().buffer_as_keystr(),
+                           kstr.get_length_as_keystr());
+            }
+
+        }
             break;
-        case HA_READ_BEFORE_KEY:
+        case BEFORE_KEY: {
             cursor = new bt_cursor_t(idx_stid, supremum, false, kstr, false, false);
             W_COERCE(cursor->next());
             if (cursor->eof()) {
                 return RC(se_TUPLE_NOT_FOUND);
             }
+            int d = memcmp(kstr.buffer_as_keystr(), cursor->key().buffer_as_keystr(),
+                           kstr.get_length_as_keystr());
+            while (d == 0 && !cursor->eof()) {
+                W_COERCE(cursor->next());
+                d = memcmp(kstr.buffer_as_keystr(), cursor->key().buffer_as_keystr(),
+                           kstr.get_length_as_keystr());
+            }
+        }
             break;
         default:
             return (RCOK);
     }
 
     if(r->idx_no==0) {
-        unpack_row((uchar *) cursor->elem(), cursor->elen(), r->mysql_format_buf, r->table);
+        r->packed_record_buf= (uchar*) cursor->elem();
+        r->packed_len= (uint) cursor->elen();
     }else{
         bool found;
-        uint pksz = r->table->key_info[0].key_length;
 
-        curr_numberOfRecs =cursor->elem()[0];
+        uint pksz = indexes[0].getKeylength();
+
+        curr_numberOfRecs = (uint) cursor->elem()[0];
         curr_element=0;
 
-        uchar* tmp_pk_buffer = (uchar*) my_malloc((size_t) pksz, MYF(MY_WME));
-        memcpy(tmp_pk_buffer, cursor->elem()+curr_element*pksz+1, pksz);
-        w_keystr_t kstr;
-        kstr.construct_regularkey(tmp_pk_buffer, pksz);
-        //TODO can we get this better?
+        w_keystr_t primarykstr;
+        primarykstr.construct_regularkey(cursor->elem(), cursor->elen());
         smsize_t size=1;
-        uchar* buf= (uchar*) my_malloc(size, MYF(MY_WME));
-        w_rc_t rc = foster_handle->find_assoc(r->pkstid,kstr, buf, size, found);
+        uchar* buf= (uchar*) malloc(size);
+        w_rc_t rc = foster_handle->find_assoc(indexes[0].getStid(),primarykstr,
+                                              buf, size, found);
+        if(!found) return RC(eINTERNAL); //TODO err msg corrupted index
         if(rc.is_error() && rc.err_num()==eRECWONTFIT){
-            buf= (uchar*) my_realloc(buf, size, MYF(MY_WME));
-            foster_handle->find_assoc(r->pkstid, kstr, buf, size,found);
+            buf= (uchar*) realloc(buf, size);
+            foster_handle->find_assoc(indexes[0].getStid(), primarykstr,
+                                      buf, size,found);
         }
-        unpack_row(buf, size, r->mysql_format_buf, r->table);
+        r->packed_record_buf= buf;
+        r->packed_len=size;
     }
     return (RCOK);
 
 }
 
-w_rc_t fstr_wrk_thr_t::next(){
-    read_request_t* r = static_cast<read_request_t*>(req);
+w_rc_t fstr_wrk_thr_t::next(read_request_t* r){
+    if(r->table_info_array.size()==0) return RC(eINTERNAL);
+    capnp::FlatArrayMessageReader fareader(r->table_info_array);
+    FosterTableInfo::Reader table_reader = fareader.getRoot<FosterTableInfo>();
+    capnp::List<FosterIndexInfo>::Reader indexes = table_reader.getIndexes();
     if(r->idx_no!=0){
+<<<<<<< HEAD
         curr_element++;
         if(curr_element<curr_numberOfRecs){
             bool found;
@@ -573,35 +903,105 @@ w_rc_t fstr_wrk_thr_t::next(){
             }else{
                 return RC(se_TUPLE_NOT_FOUND);
             }
+=======
+        bool found;
+        cursor->next();
+        if(cursor->eof())
+            return  RC(se_TUPLE_NOT_FOUND);
+
+        int d = memcmp(cursor->_lower.buffer_as_keystr(),cursor->key().buffer_as_keystr(),
+                       cursor->_lower.get_length_as_keystr());
+        if(d!=0 && _find_exact) return RC(se_TUPLE_NOT_FOUND);
+        w_keystr_t primarykstr;
+        primarykstr.construct_regularkey(cursor->elem(), cursor->elen());
+        smsize_t size=1;
+        uchar* buf= (uchar*) malloc(size);
+        w_rc_t rc = foster_handle->find_assoc(indexes[0].getStid(),primarykstr,
+                                              buf, size, found);
+        if(!found) return RC(eINTERNAL); //TODO err msg corrupted index
+        if(rc.is_error() && rc.err_num()==eRECWONTFIT){
+            buf= (uchar*) realloc(buf, size);
+            foster_handle->find_assoc(indexes[0].getStid(), primarykstr,
+                                      buf, size,found);
+>>>>>>> foster_rework
         }
+        r->packed_record_buf= buf;
+        r->packed_len=size;
+
+//        curr_element++;
+//        uint pksz=indexes[0].getKeylength();
+//        smsize_t size=1;
+//        uchar* buf= (uchar*) malloc(size);
+//        bool found;
+//        w_keystr_t kstr;
+//        if(curr_element<curr_numberOfRecs){
+//
+//            kstr.construct_regularkey(cursor->elem()+curr_element*pksz+1, pksz);
+//
+//            w_rc_t rc = foster_handle->find_assoc(indexes[0].getStid(),kstr, buf, size, found);
+//            if(rc.is_error() && rc.err_num()==eRECWONTFIT){
+//                buf= (uchar*) realloc(buf, size);
+//                foster_handle->find_assoc(indexes[0].getStid(), kstr, buf, size,found);
+//            }
+//            r->packed_record_buf= buf;
+//            r->packed_len=size;
+//        }else{
+//            W_COERCE(cursor->next());
+//            if(!cursor->eof()) {
+//                curr_numberOfRecs =(uint) cursor->elem()[0];
+//                curr_element=0;
+//                kstr.construct_regularkey( cursor->elem()+curr_element*pksz+1, pksz);
+//                w_rc_t rc = foster_handle->find_assoc(indexes[0].getStid(), kstr, buf, size, found);
+//                if (rc.is_error() && rc.err_num() == eRECWONTFIT) {
+//                    buf = (uchar *) realloc(buf, size);
+//                    foster_handle->find_assoc(indexes[0].getStid(), kstr, buf, size, found);
+//                }
+//                r->packed_record_buf= buf;
+//                r->packed_len=size;
+//            }else{
+//                return RC(se_TUPLE_NOT_FOUND);
+//            }
+//        }
     }else {
         W_COERCE(cursor->next());
-        if (!cursor->eof()) {
-            unpack_row((uchar *) cursor->elem(), cursor->elen(), r->mysql_format_buf, r->table);
-            return RCOK;
-        } else {
+        if (cursor->eof())
             return RC(se_TUPLE_NOT_FOUND);
-        }
+
+        r->packed_record_buf= (uchar*) cursor->elem();
+        r->packed_len= (uint) cursor->elen();
     }
+    return RCOK;
 }
 
 
 
-w_rc_t fstr_wrk_thr_t::position_read(){
-    read_request_t* r = static_cast<read_request_t*>(req);
+w_rc_t fstr_wrk_thr_t::position_read(read_request_t* r){
+    if(r->table_info_array.size()==0) return RC(eINTERNAL);
+    capnp::FlatArrayMessageReader fareader(r->table_info_array);
+    FosterTableInfo::Reader table_reader = fareader.getRoot<FosterTableInfo>();
+    capnp::List<FosterIndexInfo>::Reader indexes = table_reader.getIndexes();
     bool found;
     w_rc_t rc;
     w_keystr_t kstr;
     kstr.construct_regularkey(r->key_buf, r->ksz);
-    uchar* record_buf;
+    uchar* buf;
     smsize_t size=1;
+<<<<<<< HEAD
     record_buf= (uchar*) my_malloc(size, MYF(MY_WME));
     rc = foster_handle->find_assoc(r->stid,kstr,record_buf,size, found);
     if(rc.is_error() && rc.err_num()==eRECWONTFIT){
         record_buf = (uchar *) my_realloc(record_buf, size, MYF(MY_WME));
         rc = foster_handle->find_assoc(r->stid,kstr,record_buf,size, found);
+=======
+    buf= (uchar*) malloc(size);
+    rc = foster_handle->find_assoc(indexes[0].getStid(),kstr,buf,size, found);
+    if(rc.is_error() && rc.err_num()==eRECWONTFIT){
+        buf = (uchar *) realloc(buf, size);
+        rc = foster_handle->find_assoc(indexes[0].getStid(),kstr,buf,size, found);
+>>>>>>> foster_rework
     }
-    unpack_row(record_buf, size, r->mysql_format_buf, r->table);
+    r->packed_record_buf= buf;
+    r->packed_len=size;
     return rc;
 }
 
@@ -611,6 +1011,7 @@ int fstr_wrk_thr_t::add_to_secondary_idx(StoreID sec_id, w_keystr_t sec_kstr, w_
 
     w_rc_t rc;
     bool found;
+<<<<<<< HEAD
     smsize_t size=primary.get_length_as_nonkeystr();
     uchar* record_buf= (uchar*) my_malloc(size, MYF(MY_WME | MY_ZEROFILL));
     rc = foster_handle->find_assoc(sec_id,sec_kstr,record_buf,size, found);
@@ -662,14 +1063,83 @@ int fstr_wrk_thr_t::add_to_secondary_idx(StoreID sec_id, w_keystr_t sec_kstr, w_
         record_buf--;
         foster_handle->create_assoc(sec_id, sec_kstr, vec_t(record_buf, primary.get_length_as_nonkeystr()+ 1));
         my_free(record_buf);
+=======
+    smsize_t size=primary.get_length_as_nonkeystr()+1;
+    uint pksz = primary.get_length_as_nonkeystr();
+    uchar* record_buf= (uchar*) malloc(size);
+    rc=foster_handle->bt->lookup(sec_id, sec_kstr, record_buf, size, found);
+    if(rc.is_error() && rc.err_num()==eRECWONTFIT){
+        record_buf = (uchar *) realloc(record_buf, size);
+        rc=foster_handle->bt->lookup(sec_id, sec_kstr, record_buf, size, found);
+    }
+    if(found){
+        if(foster_handle->bt->max_entry_size()<=size+pksz) {
+            uint numberOfRecs = record_buf[0] + 1;
+            uchar *new_buf = (uchar *) malloc(numberOfRecs * pksz + 1);
+            uchar *curr = new_buf;
+            *curr++ = numberOfRecs;
+            uchar *tmp_pk_buffer = (uchar *) malloc(pksz);
+            w_keystr_t compare_key;
+            record_buf++;
+            bool done;
+            for (uint i = 0; i < numberOfRecs - 1; i++) {
+                memcpy(tmp_pk_buffer, record_buf + (i * pksz), pksz);
+                compare_key.construct_regularkey(tmp_pk_buffer, pksz);
+                if (compare_key.compare(primary) > 0 && !done) {
+                    memcpy(curr, primary.serialize_as_nonkeystr().c_str(), pksz);
+                    curr += pksz;
+                    memcpy(curr, tmp_pk_buffer, pksz);
+                    curr += pksz;
+                    done = true;
+                } else {
+                    memcpy(curr, tmp_pk_buffer, pksz);
+                    curr += pksz;
+                }
+            }
+            if (!done) {
+                memcpy(curr, primary.serialize_as_nonkeystr().c_str(), pksz);
+            }
+            free(tmp_pk_buffer);
+            rc = foster_handle->bt->put(sec_id, sec_kstr, vec_t(new_buf, numberOfRecs * pksz + 1));
+            free(new_buf);
+            free(--record_buf);
+            return 0;
+        }else{
+            return 1;
+        }
+    }else{
+        *record_buf++=1;
+        memcpy(record_buf,primary.serialize_as_nonkeystr().c_str(), primary.get_length_as_nonkeystr());
+        record_buf--;
+        foster_handle->bt->insert(sec_id, sec_kstr,
+                                  vec_t(record_buf, size)) ;
+        free(record_buf);
+>>>>>>> foster_rework
         return 0;
     }
+}
+
+
+
+int fstr_wrk_thr_t::add_to_secondary_idx_uniquified(StoreID sec_id, w_keystr_t sec_kstr, w_keystr_t primary){
+    w_rc_t rc;
+    bool found;
+    w_keystr_t uniquified;
+    foster_handle->bt->max_entry_size();
+    uchar* buf = (uchar*) malloc(sec_kstr.get_length_as_keystr()+primary.get_length_as_nonkeystr());
+    sec_kstr.serialize_as_nonkeystr(buf);
+    primary.serialize_as_nonkeystr(buf+sec_kstr.get_length_as_nonkeystr());
+    uniquified.construct_regularkey(buf,sec_kstr.get_length_as_nonkeystr()+primary.get_length_as_nonkeystr());
+    foster_handle->bt->insert(sec_id,uniquified,
+                              vec_t(primary.serialize_as_nonkeystr().c_str(),primary.get_length_as_nonkeystr()));
+
 }
 
 int fstr_wrk_thr_t::delete_from_secondary_idx(StoreID sec_id, w_keystr_t sec_kstr, w_keystr_t primary){
     w_rc_t rc;
     bool found;
     smsize_t size=primary.get_length_as_nonkeystr()+1;
+<<<<<<< HEAD
     uchar* record_buf= (uchar*) my_malloc(size, MYF(MY_WME | MY_ZEROFILL));
     rc = foster_handle->find_assoc(sec_id,sec_kstr,record_buf,size, found);
     if(rc.is_error() && rc.err_num()==eRECWONTFIT){
@@ -691,6 +1161,31 @@ int fstr_wrk_thr_t::delete_from_secondary_idx(StoreID sec_id, w_keystr_t sec_kst
         bool done;
 
         for(int i=0; i< numberOfRecs+1; i++){
+=======
+    uchar* record_buf= (uchar*) malloc(size);
+
+    rc=foster_handle->bt->lookup(sec_id, sec_kstr, record_buf, size, found);
+    if(rc.is_error() && rc.err_num()==eRECWONTFIT){
+        record_buf = (uchar *) realloc(record_buf, size);
+        rc=foster_handle->bt->lookup(sec_id, sec_kstr, record_buf, size, found);
+    }
+    if(found){
+        uint pksz = primary.get_length_as_nonkeystr();
+        uint numberOfRecs= record_buf[0]-1;
+        if(numberOfRecs==0) {
+            rc= foster_handle->bt->remove(sec_id, sec_kstr);
+            return 0;
+        }
+
+        uchar* new_buf = (uchar*) malloc(numberOfRecs*pksz+1);
+        uchar* curr=new_buf;
+        *curr++=numberOfRecs;
+        uchar* tmp_pk_buffer = (uchar*) malloc(pksz);
+
+        w_keystr_t compare_key;
+        record_buf++;
+        for(uint i=0; i< numberOfRecs+1; i++){
+>>>>>>> foster_rework
             memcpy(tmp_pk_buffer, record_buf+(i*pksz), pksz);
             compare_key.construct_regularkey(tmp_pk_buffer, pksz);
             if(compare_key.compare(primary)!=0){
@@ -698,15 +1193,23 @@ int fstr_wrk_thr_t::delete_from_secondary_idx(StoreID sec_id, w_keystr_t sec_kst
                 curr+=pksz;
             }
         }
+<<<<<<< HEAD
 
         my_free(tmp_pk_buffer);
         foster_handle->put_assoc(sec_id,sec_kstr,vec_t(new_buf, numberOfRecs*pksz+1));
         my_free(new_buf);
         my_free(--record_buf);
+=======
+        rc=foster_handle->bt->put(sec_id, sec_kstr, vec_t(new_buf, numberOfRecs*pksz+1));
+        free(tmp_pk_buffer);
+        free(new_buf);
+        free(--record_buf);
+>>>>>>> foster_rework
         return 0;
     }else{
         return 1;
     }
+<<<<<<< HEAD
 //
 //
 //    int pksz=primary.get_length_as_nonkeystr();
@@ -744,7 +1247,21 @@ int fstr_wrk_thr_t::delete_from_secondary_idx(StoreID sec_id, w_keystr_t sec_kst
 //    }
 //    my_free(tmp_pk_buffer);
 //    foster_handle->put_assoc(sec_id,sec_kstr,vec_t(new_buffer, len-pksz));
+=======
+}
+>>>>>>> foster_rework
 
+
+int fstr_wrk_thr_t::delete_from_secondary_idx_uniquified(StoreID sec_id,
+                                                         w_keystr_t sec_kstr,
+                                                         w_keystr_t primary){
+    w_rc_t rc;
+    w_keystr_t uniquified;
+    uchar* buf = (uchar*) malloc(sec_kstr.get_length_as_keystr()+primary.get_length_as_nonkeystr());
+    sec_kstr.serialize_as_nonkeystr(buf);
+    primary.serialize_as_nonkeystr(buf+sec_kstr.get_length_as_nonkeystr());
+    uniquified.construct_regularkey(buf,sec_kstr.get_length_as_nonkeystr()+primary.get_length_as_nonkeystr());
+    rc=foster_handle->bt->remove(sec_id,uniquified);
 }
 
 
