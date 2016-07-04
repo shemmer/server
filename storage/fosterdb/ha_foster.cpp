@@ -450,7 +450,7 @@ int ha_foster::close(void)
   int rc= 0;
   DBUG_ENTER("ha_foster::close");
   destroy_record_buffer(record_buffer);
-  if(key_buffer) free(key_buffer);
+  //if(key_buffer) free(key_buffer);
   DBUG_RETURN(free_share(share) || rc);
 }
 
