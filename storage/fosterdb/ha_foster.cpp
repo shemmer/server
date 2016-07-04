@@ -956,7 +956,6 @@ int ha_foster::index_read(uchar *buf, const uchar *key, uint key_len,
   rc=req->err;
   if(req->err==0){
     unpack_row(req->packed_record_buf,req->packed_len, buf,table);
-    free(req->packed_record_buf);
     pthread_mutex_destroy(&req->LOCK_work_mutex);
     delete(req);
     table->status=0;
