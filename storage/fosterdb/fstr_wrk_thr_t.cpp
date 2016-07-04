@@ -928,7 +928,6 @@ w_rc_t fstr_wrk_thr_t::position_read(read_request_t* r){
     kstr.construct_regularkey(r->key_buf, r->ksz);
     uchar* buf;
     smsize_t size=1;
-
     buf= (uchar*) malloc(size);
     rc = foster_handle->find_assoc(indexes[0].getStid(),kstr,buf,size, found);
     if(rc.is_error() && rc.err_num()==eRECWONTFIT){
@@ -996,7 +995,6 @@ int fstr_wrk_thr_t::add_to_secondary_idx(StoreID sec_id, w_keystr_t sec_kstr, w_
         foster_handle->bt->insert(sec_id, sec_kstr,
                                   vec_t(record_buf, size)) ;
         free(record_buf);
-
         return 0;
     }
 }
@@ -1045,7 +1043,6 @@ int fstr_wrk_thr_t::delete_from_secondary_idx(StoreID sec_id, w_keystr_t sec_kst
         w_keystr_t compare_key;
         record_buf++;
         for(uint i=0; i< numberOfRecs+1; i++){
-
             memcpy(tmp_pk_buffer, record_buf+(i*pksz), pksz);
             compare_key.construct_regularkey(tmp_pk_buffer, pksz);
             if(compare_key.compare(primary)!=0){
@@ -1064,7 +1061,6 @@ int fstr_wrk_thr_t::delete_from_secondary_idx(StoreID sec_id, w_keystr_t sec_kst
     }
 
 }
-
 
 int fstr_wrk_thr_t::delete_from_secondary_idx_uniquified(StoreID sec_id,
                                                          w_keystr_t sec_kstr,
