@@ -13,11 +13,14 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
 
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
+
 INCLUDE_DIRECTORIES (
         ${CMAKE_CURRENT_SOURCE_DIR}/zero/config
         ${CMAKE_CURRENT_SOURCE_DIR}/zero/src/common
         ${CMAKE_CURRENT_SOURCE_DIR}/zero/src/cmd
         ${CMAKE_CURRENT_SOURCE_DIR}/zero/src/sm
+        ${CMAKE_CURRENT_SOURCE_DIR}/generated
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
 INCLUDE_DIRECTORIES (
@@ -29,7 +32,15 @@ INCLUDE_DIRECTORIES (
         ${CMAKE_CURRENT_BINARY_DIR}
 )
 
-ADD_DEFINITIONS("-std=c++11 -fexceptions")
+#find_package(FlatBuffers REQUIRED)
+
+
+find_package(CapnProto REQUIRED)
+include_directories(${CAPNP_INCLUDE_DIRS})
+add_definitions(${CAPNP_DEFINITIONS})
+capnp_generate_cpp(CAPNP_SRCS CAPNP_HDRS /generated/catentries.capnp)
+
+ADD_DEFINITIONS("-std=c++11 -fexceptions ")
 
 add_subdirectory(zero)
 
@@ -44,3 +55,4 @@ MYSQL_ADD_PLUGIN(foster ${FOSTER_SOURCES}
         foster)
 
 target_link_libraries(foster sm)
+target_link_libraries(foster ${CAPNP_LIBRARIES_LITE})
