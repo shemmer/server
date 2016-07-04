@@ -21,104 +21,40 @@
 #ifdef USE_PRAGMA_INTERFACE
 #pragma interface     /* gcc class implementation */
 #endif
+//
+#include <config.h>
 
-#include <my_config.h>
+#include "catEntries_generated.h"
+#include <handler.h>
+#include <cat_entries.capnp.h>
+#include <w_key.h>
 
-#include "sql_table.h"
-
-#include "sql_class.h"
-
-#include "fstr_wrk_thr_t.h"
 
 typedef struct st_foster_record_buffer {
     uchar *buffer;
     uint32 length;
 } foster_record_buffer;
 
-
-typedef struct st_foster_idx {
-    char* index_name;
-    uint index_name_length;
-    uint stid;
-} foster_index;
-
-static uchar* foster_index_get_key(foster_index* idx, size_t *length,
-                            my_bool not_used __attribute__((unused)))
-{
-    *length=idx->index_name_length;
-    return (uchar*) idx->index_name;
-}
-
-
 class FOSTER_SHARE: Handler_share{
 public:
-    char *table_name;
+    w_keystr_t table_keystr;
     uint table_name_length, use_count;
-    mysql_mutex_t mutex;
-    THR_LOCK lock;
+    mysql_mutex_t share_mutex;
+    THR_LOCK share_lock;
 
-    HASH foster_indexes;
+    kj::ArrayPtr<const capnp::word> table_info_array;
+    bool initialized=false;
 
     ~FOSTER_SHARE(){
-        thr_lock_delete(&lock);
-        mysql_mutex_destroy(&mutex);
+        thr_lock_delete(&share_lock);
+        mysql_mutex_destroy(&share_mutex);
     }
 
 
-    void init_hash(){
-        (void) my_hash_init(&foster_indexes,system_charset_info,32,0,0,
-                            (my_hash_get_key) foster_index_get_key,0,0);
-    }
-
-    foster_index* get_storeid(char* idx_name_buf, uint length){
-        foster_index* fosteridx;
-        char *tmp_name;
-        if (!(fosteridx=(foster_index*) my_hash_search(&foster_indexes, (uchar*) idx_name_buf, length)))
-        {
-                return NULL;
-        }
-        return fosteridx;
-    }
-
-    bool add_storeid(char* idx_name_buf, uint length, uint storeid){
-        char *tmp_name;
-        foster_index* fosteridx;
-        if (!my_multi_malloc(MYF(MY_WME | MY_ZEROFILL),
-                         &fosteridx, sizeof(*fosteridx),
-                         &tmp_name, length+1,
-                         NullS))
-        {
-            return false;
-        }
-
-        fosteridx->index_name=tmp_name;
-        fosteridx->index_name_length=length;
-        fosteridx->stid=storeid;
-
-        strmov(fosteridx->index_name, idx_name_buf);
-
-        if (my_hash_insert(&foster_indexes, (uchar*) fosteridx)){
-            return false;
-        }
-        return true;
-    }
-
-    std::vector<uint> get_all_storeids(){
-        std::vector<uint> stid_vector(foster_indexes.array.elements);
-        for(int i=0; i< foster_indexes.array.elements; i++){
-            foster_index* index = (foster_index*) my_hash_element(&foster_indexes, i);
-            if(strcmp(index->index_name,"PRIMARY")==0 && i!=0){
-                uint tmp = stid_vector[0];
-                stid_vector[0]=index->stid;
-                stid_vector[i]=tmp;
-            }else {
-                stid_vector[i] = index->stid;
-            }
-        }
-        return stid_vector;
-    }
 };
 
+
+class fstr_wrk_thr_t;
 /** @brief
   Class definition for the storage engine
 */
@@ -176,7 +112,6 @@ public:
     uint max_supported_record_length() const { return HA_MAX_REC_LENGTH; }
 
     uint max_supported_keys()          const { return 10; }
-
 
     uint max_supported_key_parts()     const { return 10; }
 
@@ -243,4 +178,16 @@ public:
 
     THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
                                enum thr_lock_type lock_type);     ///< required
+
+
+
+    int get_foreign_key_list(THD *thd, List<FOREIGN_KEY_INFO> *f_key_list)
+    { return 0; }
+
+    int get_parent_foreign_key_list(THD *thd, List<FOREIGN_KEY_INFO> *f_key_list)
+    { return 0; }
+
+    uint referenced_by_foreign_key() { return 0;}
+
+    void free_foreign_key_create_info(char* str) {}
 };
