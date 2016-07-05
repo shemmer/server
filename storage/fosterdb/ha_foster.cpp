@@ -37,6 +37,8 @@ mysql_mutex_t foster_mutex;
 static char* fstr_db_var;
 static char* fstr_logdir_var;
 
+static FOSTER_THREAD_POOL *worker_pool;
+
 static handler *foster_create_handler(handlerton *hton,
                                       TABLE_SHARE *table,
                                       MEM_ROOT *mem_root);
@@ -166,11 +168,19 @@ static int fstr_commit(handlerton *hton, THD *thd, bool all){
     }
     pthread_mutex_unlock(&req->LOCK_work_mutex);
 
+
     pthread_mutex_destroy(&req->LOCK_work_mutex);
     delete (req);
+
     thd_set_ha_data(thd, hton, nullptr);
-    worker->foster_exit();
-    delete (worker);
+    pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
+    worker_pool->pool.push_back(worker);
+    worker_pool->changed=true;
+    pthread_cond_broadcast(&worker_pool->COND_pool);
+    pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
+    worker=nullptr;
+//    worker->foster_exit();
+//    delete (worker);
     DBUG_RETURN(0);
   }else{
     //end of a statement
@@ -204,6 +214,14 @@ static int fstr_rollback(handlerton *hton, THD *thd, bool all){
   worker->aborted=true;
   pthread_mutex_destroy(&req->LOCK_work_mutex);
   delete (req);
+
+  pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
+
+  worker_pool->pool.push_back(worker);
+  worker_pool->changed=true;
+  pthread_cond_broadcast(&worker_pool->COND_pool);
+  pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
+  worker=nullptr;
 
   DBUG_RETURN(0);
 }
@@ -245,9 +263,10 @@ static int foster_init_func(void *p)
   req->db=fstr_db_var;
   req->logdir=fstr_logdir_var;
 
-  ha_foster::main_thread = new fstr_wrk_thr_t(false);
+  ha_foster::main_thread = new fstr_wrk_thr_t();
 
-  ha_foster::main_thread->translate_err_code= std::bind(translate_err_code, std::placeholders::_1);
+  ha_foster::main_thread->translate_err_code= std::bind(translate_err_code,
+                                                        std::placeholders::_1);
   pthread_mutex_lock(&ha_foster::main_thread->thread_mutex);
   ha_foster::main_thread->set_request(req);
   ha_foster::main_thread->notify(true);
@@ -257,10 +276,22 @@ static int foster_init_func(void *p)
   while(!req->notified){
     pthread_cond_wait(&req->COND_work, &req->LOCK_work_mutex);
   }
-
   pthread_mutex_unlock(&req->LOCK_work_mutex);
   pthread_mutex_destroy(&req->LOCK_work_mutex);
   delete(req);
+
+  worker_pool= new FOSTER_THREAD_POOL;
+  pthread_mutex_init(&worker_pool->LOCK_pool_mutex, NULL);
+  pthread_cond_init(&worker_pool->COND_pool, NULL);
+  pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
+  worker_pool->changed=false;
+  worker_pool->pool=*new std::vector<fstr_wrk_thr_t*>();
+  for(int i=0; i< worker_pool->pool_size; i++){
+    fstr_wrk_thr_t* curr = new fstr_wrk_thr_t();
+    curr->translate_err_code= std::bind(translate_err_code, std::placeholders::_1);
+    worker_pool->pool.push_back(curr);
+  }
+  pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
   DBUG_RETURN(0);
 }
 
@@ -286,12 +317,25 @@ static int foster_deinit_func(void *p){
   while(!req->notified){
     pthread_cond_wait(&req->COND_work, &req->LOCK_work_mutex);
   }
-
   pthread_mutex_unlock(&req->LOCK_work_mutex);
   delete(req);
-
   ha_foster::main_thread->foster_exit();
   delete(ha_foster::main_thread);
+
+
+  worker_pool= new FOSTER_THREAD_POOL;
+  pthread_mutex_init(&worker_pool->LOCK_pool_mutex, NULL);
+  pthread_cond_init(&worker_pool->COND_pool, NULL);
+  pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
+  worker_pool->changed=false;
+  for(uint i=0; i< worker_pool->pool_size; i++){
+    worker_pool->pool.at(i)->foster_exit();
+    delete(worker_pool->pool.at(i));
+  }
+  pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
+  pthread_mutex_destroy(&worker_pool->LOCK_pool_mutex);
+  pthread_cond_destroy(&worker_pool->COND_pool);
+  delete(worker_pool);
 
   my_hash_free(&foster_open_tables);
   mysql_mutex_destroy(&foster_mutex);
@@ -644,7 +688,7 @@ int ha_foster::create(const char *name, TABLE *table_arg,
   pthread_cond_init(  &req->COND_work, NULL);
   req->type=FOSTER_CREATE;
 
-  fstr_wrk_thr_t* func_worker = new fstr_wrk_thr_t(true);
+  fstr_wrk_thr_t* func_worker = new fstr_wrk_thr_t();
   func_worker->translate_err_code= std::bind(translate_err_code, std::placeholders::_1);
   pthread_mutex_lock(&func_worker->thread_mutex);
   func_worker->set_request(req);
@@ -691,7 +735,7 @@ int ha_foster::delete_table(const char *name)
   //Init the request condition -> used to signal the handler when the worker is done
   pthread_cond_init(  &req->COND_work, NULL);
 
-  fstr_wrk_thr_t* del_worker = new fstr_wrk_thr_t(true);
+  fstr_wrk_thr_t* del_worker = new fstr_wrk_thr_t();
 
   del_worker->translate_err_code= std::bind(translate_err_code, std::placeholders::_1);
   string separator= "###";
@@ -1219,8 +1263,13 @@ int ha_foster::external_lock(THD *thd, int lock_type)
           delete (req);
         }
         thd_set_ha_data(thd, ht, nullptr);
-        worker->foster_exit();
-        delete (worker);
+        pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
+        worker_pool->pool.push_back(worker);
+        worker_pool->changed=true;
+        pthread_cond_broadcast(&worker_pool->COND_pool);
+        pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
+//        worker->foster_exit();
+//        delete (worker);
       }
     }
   }
@@ -1228,11 +1277,47 @@ int ha_foster::external_lock(THD *thd, int lock_type)
   {
     if (!worker)
     {
+      pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
       // beginning of new transaction
-      worker = new fstr_wrk_thr_t(true);
+//      worker = new fstr_wrk_thr_t(true);
+//      worker->translate_err_code =std::bind(translate_err_code, std::placeholders::_1);
+      while(worker_pool->pool.empty() && !worker_pool->changed){
+        pthread_cond_wait(&worker_pool->COND_pool, &worker_pool->LOCK_pool_mutex);
+      }
+
+
+      worker=worker_pool->pool.back();
+      worker_pool->pool.pop_back();
+      worker_pool->changed=false;
+
+      base_request_t *req = new base_request_t();
+      //Locking work request mutex
+      pthread_mutex_init(&req->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
+      pthread_mutex_lock(&req->LOCK_work_mutex);
+      //Init the request condition -> used to signal the handler when the worker is done
+      pthread_cond_init(  &req->COND_work, NULL);
+
+      req->type = FOSTER_BEGIN;
+      worker->set_request(req);
+      worker->notify(true);
+      pthread_mutex_lock(&worker->thread_mutex);
+      worker->set_request(req);
+      worker->notify(true);
+      pthread_cond_signal(&worker->COND_worker);
+      pthread_mutex_unlock(&worker->thread_mutex);
+      while (!req->notified) {
+        pthread_cond_wait(&req->COND_work, &req->LOCK_work_mutex);
+      }
+      pthread_mutex_unlock(&req->LOCK_work_mutex);
+
+      pthread_mutex_destroy(&req->LOCK_work_mutex);
+      delete (req);
+
+      pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
+
       thd_set_ha_data(thd, ht, worker);
       trans_register_ha(thd, multi_stmt, ht);
-      worker->translate_err_code =std::bind(translate_err_code, std::placeholders::_1);
+
     }
     worker->numUsedTables++;
   }

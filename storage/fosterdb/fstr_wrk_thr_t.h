@@ -37,7 +37,6 @@
 #include <capnp/message.h>
 #include <capnp/serialize-packed.h>
 
-
 typedef struct st_fstr_fk_info
 {
     string foreign_id;
@@ -76,6 +75,7 @@ const int FOSTER_POS_READ = 18;
 
 const int FOSTER_COMMIT =20;
 const int FOSTER_ROLLBACK=21;
+const int FOSTER_BEGIN=22;
 
 struct base_request_t{
     pthread_cond_t COND_work;
@@ -256,9 +256,6 @@ class fstr_wrk_thr_t : public smthread_t{
     w_rc_t next(read_request_t* r);
     w_rc_t position_read(read_request_t* r);
 
-    w_rc_t foster_commit();
-    w_rc_t foster_rollback();
-
     void foster_config(sm_options* options);
 
 
@@ -266,7 +263,6 @@ class fstr_wrk_thr_t : public smthread_t{
 
     bool _exit=false;
 
-    bool _begin_tx;
     //TODO this is really ugly
     bool _find_exact=false;
 
@@ -284,7 +280,7 @@ public:
 
     pthread_cond_t COND_worker;
 
-    fstr_wrk_thr_t(bool begin);
+    fstr_wrk_thr_t();
 
     void run();
     void set_request(base_request_t* r) {
@@ -296,8 +292,20 @@ public:
     }
     void foster_exit();
 
+    w_rc_t foster_begin();
+    w_rc_t foster_commit();
+    w_rc_t foster_rollback();
+
     std::function<int(int)> translate_err_code;
 };
 
+
+typedef struct st_fstr_wrk_thr_pool{
+    uint pool_size=10;
+    std::vector<fstr_wrk_thr_t*> pool;
+    pthread_mutex_t LOCK_pool_mutex;
+    pthread_cond_t COND_pool;
+    bool changed;
+}FOSTER_THREAD_POOL;
 
 #endif //MYSQL_FSTR_WRK_THR_H
