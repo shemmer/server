@@ -9,8 +9,8 @@
 
 ss_m* fstr_wrk_thr_t::foster_handle;
 
-fstr_wrk_thr_t::fstr_wrk_thr_t(bool begin):
-         smthread_t(t_regular, "trx_worker"), _begin_tx(begin){
+fstr_wrk_thr_t::fstr_wrk_thr_t():
+         smthread_t(t_regular, "trx_worker"){
 //    init_foster_psi_keys();
     pthread_mutex_init(&thread_mutex, NULL);
     pthread_cond_init(&COND_worker, NULL);
@@ -33,7 +33,6 @@ void fstr_wrk_thr_t::foster_exit(){
 
 
 void fstr_wrk_thr_t::foster_config(sm_options* options){
-
     start_stop_request_t *start_req = static_cast<start_stop_request_t *>(req);
 
     string logdir(start_req->logdir);
@@ -115,10 +114,6 @@ void fstr_wrk_thr_t::run(){
         pthread_mutex_unlock(&thread_mutex);
         notified=false;
         if(_exit) return;
-        if(_begin_tx){
-            W_COERCE(foster_handle->begin_xct());
-            _begin_tx=false;
-        }
         rval = work_ACTIVE();
         if(rval) return;
     }
@@ -154,6 +149,8 @@ int fstr_wrk_thr_t::work_ACTIVE(){
             err=foster_commit(); break;
         case FOSTER_ROLLBACK:
             err=foster_rollback();break;
+        case FOSTER_BEGIN:
+            err=foster_begin(); break;
         default: break;
     }
     req->err=translate_err_code(err.err_num());
@@ -176,10 +173,10 @@ w_rc_t fstr_wrk_thr_t::startup() {
     if (!vol->is_alloc_store(1))
     {
         StoreID cat_stid =1;
-        W_COERCE(foster_handle->begin_xct());
+        W_COERCE(foster_begin());
         W_COERCE(foster_handle->create_index(cat_stid));
         w_assert0(cat_stid == 1);
-        W_COERCE(foster_handle->commit_xct());
+        W_COERCE(foster_commit());
     }
     return RCOK;
 }
@@ -229,6 +226,7 @@ w_keystr_t foster_key_copy(uchar *to_key, uchar *from_record, FosterIndexInfo::R
 w_rc_t fstr_wrk_thr_t::create_physical_table(ddl_request_t* r){
     StoreID cat_stid =1;
     StoreID primary_stid;
+    W_COERCE(foster_begin());
     //Create the primary index
     W_COERCE(foster_handle->create_index(primary_stid));
     //Create Primary Key String from name of the database and table_name
@@ -404,7 +402,7 @@ w_rc_t fstr_wrk_thr_t::create_physical_table(ddl_request_t* r){
 //    print_capnp_table(r->capnpTable);
     err =foster_handle->create_assoc(cat_stid, cat_entry_key,
                                          vec_t(bytes.begin(),bytes.size()));
-    err= foster_handle->commit_xct();
+    W_COERCE(foster_commit());
     return err;
 }
 
@@ -432,9 +430,11 @@ w_rc_t fstr_wrk_thr_t::discover_table(discovery_request_t* r)
 
 w_rc_t fstr_wrk_thr_t::delete_table(ddl_request_t* r) {
     StoreID cat_stid =1;
+    w_rc_t err;
     w_keystr_t cat_entry = construct_cat_key(r->db_name, r->table_name);
-    w_rc_t err =foster_handle->destroy_assoc(cat_stid,cat_entry);
-    err= foster_commit();
+    W_COERCE(foster_begin());
+    err=foster_handle->destroy_assoc(cat_stid,cat_entry);
+    W_COERCE(foster_commit());
     return err;
 }
 
@@ -1074,6 +1074,11 @@ int fstr_wrk_thr_t::delete_from_secondary_idx_uniquified(StoreID sec_id,
     rc=foster_handle->bt->remove(sec_id,uniquified);
 }
 
+
+w_rc_t fstr_wrk_thr_t::foster_begin(){
+    W_COERCE(foster_handle->begin_xct());
+    return RCOK;
+}
 
 w_rc_t fstr_wrk_thr_t::foster_commit(){
     W_COERCE(foster_handle->commit_xct());
