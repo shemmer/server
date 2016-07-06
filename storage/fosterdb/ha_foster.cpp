@@ -435,7 +435,12 @@ int ha_foster::open(const char *name, int mode, uint test_if_locked)
 {
   DBUG_ENTER("ha_foster::open");
 
-  w_keystr_t normalized =construct_cat_key(table->s->db.str,table->s->table_name.str);
+  w_keystr_t normalized;
+  construct_cat_key(
+          table->s->db.str,
+          (uint) table->s->db.length,
+          table->s->table_name.str,
+          (uint) table->s->table_name.length, normalized);
   if (!(share= get_share(normalized))){
     DBUG_RETURN(HA_ERR_OUT_OF_MEM);
   }
@@ -727,9 +732,11 @@ int ha_foster::create(const char *name, TABLE *table_arg,
   }
 
   for(int i=0; i<req->foreign_keys.size(); i++){
-    w_keystr_t ref_cat =
-            construct_cat_key(req->foreign_keys.at(i).referenced_db,
-                              req->foreign_keys.at(i).referenced_table);
+    w_keystr_t ref_cat;
+            construct_cat_key(const_cast<char*>(req->foreign_keys.at(i).referenced_db.c_str()),
+                              req->foreign_keys.at(i).referenced_db.length(),
+                              const_cast<char*>(req->foreign_keys.at(i).referenced_table.c_str()),
+                              req->foreign_keys.at(i).referenced_table.length(), ref_cat);
     FOSTER_SHARE* tmp;
     if((tmp =(FOSTER_SHARE*) my_hash_search(&foster_open_tables,
                                             (uchar*) ref_cat.buffer_as_keystr(),

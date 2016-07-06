@@ -230,8 +230,13 @@ w_rc_t fstr_wrk_thr_t::create_physical_table(ddl_request_t* r){
     //Create the primary index
     W_COERCE(foster_handle->create_index(primary_stid));
     //Create Primary Key String from name of the database and table_name
-    w_keystr_t cat_entry_key = construct_cat_key(r->capnpTable.getDbname().asString(),
-                                        r->capnpTable.getTablename().asString());
+    w_keystr_t cat_entry_key;
+    construct_cat_key(
+            const_cast<char*>(r->capnpTable.getDbname().asString().cStr()),
+            (uint) r->capnpTable.getDbname().asString().size(),
+            const_cast<char*>(r->capnpTable.getDbname().asString().cStr()),
+            (uint) r->capnpTable.getDbname().asString().size(), cat_entry_key
+    );
     ::capnp::List<FosterIndexInfo>::Builder indexes = r->capnpTable.getIndexes();
     FosterIndexInfo::Builder primary_idx = indexes[0];
     primary_idx.setStid(primary_stid);
@@ -252,8 +257,12 @@ w_rc_t fstr_wrk_thr_t::create_physical_table(ddl_request_t* r){
             FosterForeignTable::Builder proto_curr_fk = foreignKeys[i];
             FOSTER_FK_INFO* curr_fk_req= &r->foreign_keys.at(i);
             proto_curr_fk.setId(curr_fk_req->foreign_id);
-            w_keystr_t ref_keystr = construct_cat_key(curr_fk_req->referenced_db,
-                                                   curr_fk_req->referenced_table);
+            w_keystr_t ref_keystr;
+            construct_cat_key(
+                    const_cast<char*>(curr_fk_req->referenced_db.c_str()),
+                    curr_fk_req->referenced_db.length(),
+                    const_cast<char*>(curr_fk_req->referenced_table.c_str()),
+            curr_fk_req->referenced_table.length(), ref_keystr);
             proto_curr_fk.setForeignTableId((char*) ref_keystr.serialize_as_nonkeystr().c_str());
 
             bool found;
@@ -409,7 +418,10 @@ w_rc_t fstr_wrk_thr_t::create_physical_table(ddl_request_t* r){
 
 w_rc_t fstr_wrk_thr_t::discover_table(discovery_request_t* r)
 {
-    w_keystr_t cat_entry_key = construct_cat_key(r->db_name, r->table_name);
+    w_keystr_t cat_entry_key ;
+    construct_cat_key(const_cast<char*>(r->db_name.c_str()),
+            r->db_name.length(), const_cast<char*>(r->table_name.c_str()),
+                      r->table_name.length(), cat_entry_key);
     StoreID cat_stid =1;
     bool found;
     smsize_t size=1;
@@ -431,9 +443,13 @@ w_rc_t fstr_wrk_thr_t::discover_table(discovery_request_t* r)
 w_rc_t fstr_wrk_thr_t::delete_table(ddl_request_t* r) {
     StoreID cat_stid =1;
     w_rc_t err;
-    w_keystr_t cat_entry = construct_cat_key(r->db_name, r->table_name);
+    w_keystr_t cat_entry_key;
+    construct_cat_key(const_cast<char*>(r->db_name.c_str()),
+                      r->db_name.length(),
+                      const_cast<char*>(r->table_name.c_str()),
+                      r->table_name.length(), cat_entry_key);
     W_COERCE(foster_begin());
-    err=foster_handle->destroy_assoc(cat_stid,cat_entry);
+    err=foster_handle->destroy_assoc(cat_stid,cat_entry_key);
     W_COERCE(foster_commit());
     return err;
 }

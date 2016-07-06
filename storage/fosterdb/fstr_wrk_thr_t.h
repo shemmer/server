@@ -160,22 +160,23 @@ struct read_request_t : base_request_t{
     kj::ArrayPtr<const capnp::word> table_info_array;
 };
 
-inline w_keystr_t construct_cat_key(string db_name, string table_name){
-    string primaryStr;
+inline void construct_cat_key(char* db_name, uint db_len,
+                                    char* table_name, uint table_name_len,
+                              w_keystr_t& in){
+
     w_keystr_t ret;
-    for(uint i=0; i<db_name.length(); i++){
-        if(db_name.at(i)==' ') continue;
-        primaryStr.push_back(db_name.at(i));
+    char* temp = (char*) malloc(db_len+table_name_len+3);
+    for(uint i=0; i<db_len; i++){
+        temp[i]=db_name[i];
     }
-    primaryStr.push_back('#');
-    primaryStr.push_back('#');
-    primaryStr.push_back('#');
-    for(uint i=0; i<table_name.length(); i++){
-        if(table_name.at(i)==' ') continue;
-        primaryStr.push_back(table_name.at(i));
+    temp[db_len]= '#';
+    temp[db_len+1]= '#';
+    temp[db_len+2]= '#';
+    for(uint i=0; i<table_name_len; i++){
+        temp[db_len+3+i] = table_name[i];
     }
-    ret.construct_regularkey(primaryStr.c_str(),primaryStr.length());
-    return ret;
+    in.construct_regularkey(temp,db_len+table_name_len+3);
+    free(temp);
 }
 inline void print_capnp_table(FosterTableInfo::Reader tableinfo){
     cerr<<"################TABLE###################"<<endl;
