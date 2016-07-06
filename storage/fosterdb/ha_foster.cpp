@@ -459,16 +459,31 @@ int ha_foster::open(const char *name, int mode, uint test_if_locked)
     req->table_name= *new string(table->s->table_name.str);
     req->db_name=*new string(table->s->db.str);
 
-    pthread_mutex_lock(&main_thread->thread_mutex);
-    main_thread->set_request(req);
-    main_thread->notify(true);
-    pthread_cond_broadcast(&main_thread->COND_worker);
-    pthread_mutex_unlock(&main_thread->thread_mutex);
+    pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
+    while(worker_pool->pool.empty() && !worker_pool->changed){
+      pthread_cond_wait(&worker_pool->COND_pool, &worker_pool->LOCK_pool_mutex);
+    }
+    fstr_wrk_thr_t* func_worker =worker_pool->pool.back();
+    worker_pool->pool.pop_back();
+    worker_pool->changed=false;
+    pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
+
+    pthread_mutex_lock(&func_worker->thread_mutex);
+    func_worker->set_request(req);
+    func_worker->notify(true);
+    pthread_cond_broadcast(&func_worker->COND_worker);
+    pthread_mutex_unlock(&func_worker->thread_mutex);
 
     while(!req->notified){
       pthread_cond_wait(&req->COND_work, &req->LOCK_work_mutex);
     }
     pthread_mutex_unlock(&req->LOCK_work_mutex);
+
+    pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
+    worker_pool->pool.push_back(func_worker);
+    worker_pool->changed=true;
+    pthread_cond_broadcast(&worker_pool->COND_pool);
+    pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
 
     share->table_info_array=req->table_info_array;
     share->initialized=true;
