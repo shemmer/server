@@ -337,7 +337,6 @@ static int foster_deinit_func(void *p){
   ha_foster::main_thread->foster_exit();
   delete(ha_foster::main_thread);
 
-
   my_hash_free(&foster_open_tables);
   mysql_mutex_destroy(&foster_mutex);
   DBUG_RETURN(0);
@@ -748,7 +747,6 @@ int ha_foster::delete_table(const char *name)
 
   //Init the request condition -> used to signal the handler when the worker is done
   pthread_cond_init(  &req->COND_work, NULL);
-
 
   pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
   while(worker_pool->pool.empty() && !worker_pool->changed){
