@@ -171,8 +171,9 @@ static int fstr_commit(handlerton *hton, THD *thd, bool all){
 
     pthread_mutex_destroy(&req->LOCK_work_mutex);
     delete (req);
+    void* null=0;
 
-    thd_set_ha_data(thd, hton, nullptr);
+    thd_set_ha_data(thd, hton, null);
     pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
     worker_pool->pool.push_back(worker);
     worker_pool->changed=true;
@@ -217,6 +218,8 @@ static int fstr_rollback(handlerton *hton, THD *thd, bool all){
 
   pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
 
+  void* null=0;
+  thd_set_ha_data(thd, hton, null);
   worker_pool->pool.push_back(worker);
   worker_pool->changed=true;
   pthread_cond_broadcast(&worker_pool->COND_pool);
