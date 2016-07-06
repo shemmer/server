@@ -298,6 +298,21 @@ static int foster_init_func(void *p)
 
 static int foster_deinit_func(void *p){
   DBUG_ENTER("foster_deinit_func");
+
+  pthread_mutex_init(&worker_pool->LOCK_pool_mutex, NULL);
+  pthread_cond_init(&worker_pool->COND_pool, NULL);
+  pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
+  worker_pool->changed=false;
+  for(uint i=0; i< worker_pool->pool_size; i++){
+    worker_pool->pool.at(i)->foster_exit();
+    delete(worker_pool->pool.at(i));
+  }
+  pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
+  pthread_mutex_destroy(&worker_pool->LOCK_pool_mutex);
+  pthread_cond_destroy(&worker_pool->COND_pool);
+  delete(worker_pool);
+
+
   start_stop_request_t* req = new start_stop_request_t();
 
   //Locking work request mutex
@@ -322,19 +337,6 @@ static int foster_deinit_func(void *p){
   ha_foster::main_thread->foster_exit();
   delete(ha_foster::main_thread);
 
-
-  pthread_mutex_init(&worker_pool->LOCK_pool_mutex, NULL);
-  pthread_cond_init(&worker_pool->COND_pool, NULL);
-  pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
-  worker_pool->changed=false;
-  for(uint i=0; i< worker_pool->pool_size; i++){
-    worker_pool->pool.at(i)->foster_exit();
-    delete(worker_pool->pool.at(i));
-  }
-  pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
-  pthread_mutex_destroy(&worker_pool->LOCK_pool_mutex);
-  pthread_cond_destroy(&worker_pool->COND_pool);
-  delete(worker_pool);
 
   my_hash_free(&foster_open_tables);
   mysql_mutex_destroy(&foster_mutex);
@@ -687,7 +689,15 @@ int ha_foster::create(const char *name, TABLE *table_arg,
   pthread_cond_init(  &req->COND_work, NULL);
   req->type=FOSTER_CREATE;
 
-  fstr_wrk_thr_t* func_worker = new fstr_wrk_thr_t();
+  pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
+  while(worker_pool->pool.empty() && !worker_pool->changed){
+    pthread_cond_wait(&worker_pool->COND_pool, &worker_pool->LOCK_pool_mutex);
+  }
+  fstr_wrk_thr_t* func_worker =worker_pool->pool.back();
+  worker_pool->pool.pop_back();
+  worker_pool->changed=false;
+  pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
+
   func_worker->translate_err_code= std::bind(translate_err_code, std::placeholders::_1);
   pthread_mutex_lock(&func_worker->thread_mutex);
   func_worker->set_request(req);
@@ -713,10 +723,15 @@ int ha_foster::create(const char *name, TABLE *table_arg,
     }
   }
   pthread_mutex_unlock(&req->LOCK_work_mutex);
-  func_worker->foster_exit();
-  delete(func_worker);
-
   pthread_mutex_destroy(&req->LOCK_work_mutex);
+
+
+  pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
+  worker_pool->pool.push_back(func_worker);
+  worker_pool->changed=true;
+  pthread_cond_broadcast(&worker_pool->COND_pool);
+  pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
+
   delete(req);
   DBUG_RETURN(rc);
 }
@@ -734,7 +749,15 @@ int ha_foster::delete_table(const char *name)
   //Init the request condition -> used to signal the handler when the worker is done
   pthread_cond_init(  &req->COND_work, NULL);
 
-  fstr_wrk_thr_t* del_worker = new fstr_wrk_thr_t();
+
+  pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
+  while(worker_pool->pool.empty() && !worker_pool->changed){
+    pthread_cond_wait(&worker_pool->COND_pool, &worker_pool->LOCK_pool_mutex);
+  }
+  fstr_wrk_thr_t* del_worker =worker_pool->pool.back();
+  worker_pool->pool.pop_back();
+  worker_pool->changed=false;
+  pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
 
   del_worker->translate_err_code= std::bind(translate_err_code, std::placeholders::_1);
   string separator= "###";
@@ -769,8 +792,13 @@ int ha_foster::delete_table(const char *name)
   pthread_mutex_unlock(&req->LOCK_work_mutex);
   pthread_mutex_destroy(&req->LOCK_work_mutex);
   delete(req);
-  del_worker->foster_exit();
-  delete(del_worker);
+
+  pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
+  worker_pool->pool.push_back(del_worker);
+  worker_pool->changed=true;
+  pthread_cond_broadcast(&worker_pool->COND_pool);
+  pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
+
   DBUG_RETURN(rc);
 }
 
@@ -778,11 +806,9 @@ int ha_foster::write_row(uchar *buf) {
   int rc=0;
   DBUG_ENTER("ha_foster::write_row");
   write_request_t *req = new write_request_t();
-
   //Locking work request mutex
   pthread_mutex_init(&req->LOCK_work_mutex, NULL);
   pthread_mutex_lock(&req->LOCK_work_mutex);
-
   //Init the request condition -> used to signal the handler when the worker is done
   pthread_cond_init(  &req->COND_work, NULL);
 
@@ -838,6 +864,9 @@ int ha_foster::update_row(const uchar *old_data, uchar *new_data)
   req->mysql_format_buf=new_data;
   req->old_mysql_format_buf= const_cast<uchar*>(old_data);
   req->max_key_len=max_key_len;
+
+  if (fix_rec_buff(max_row_length(new_data)))
+    DBUG_RETURN(HA_ERR_OUT_OF_MEM);
   req->packed_record_buf=record_buffer->buffer;
 
   req->packed_len= pack_row( new_data, req->packed_record_buf,table);
@@ -868,11 +897,9 @@ int ha_foster::delete_row(const uchar *buf)
   int rc=0;
   DBUG_ENTER("ha_foster::delete_row");
   write_request_t *req = new write_request_t();
-
   //Locking work request mutex
   pthread_mutex_init(&req->LOCK_work_mutex, NULL);
   pthread_mutex_lock(&req->LOCK_work_mutex);
-
   //Init the request condition -> used to signal the handler when the worker is done
   pthread_cond_init(  &req->COND_work, NULL);
 
@@ -1261,7 +1288,8 @@ int ha_foster::external_lock(THD *thd, int lock_type)
           pthread_mutex_unlock(&req->LOCK_work_mutex);
           delete (req);
         }
-        thd_set_ha_data(thd, ht, nullptr);
+        void* null=0;
+        thd_set_ha_data(thd, ht, null);
         pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
         worker_pool->pool.push_back(worker);
         worker_pool->changed=true;
@@ -1288,7 +1316,7 @@ int ha_foster::external_lock(THD *thd, int lock_type)
       worker=worker_pool->pool.back();
       worker_pool->pool.pop_back();
       worker_pool->changed=false;
-
+      worker->numUsedTables=1;
       base_request_t *req = new base_request_t();
       //Locking work request mutex
       pthread_mutex_init(&req->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
@@ -1317,8 +1345,9 @@ int ha_foster::external_lock(THD *thd, int lock_type)
       thd_set_ha_data(thd, ht, worker);
       trans_register_ha(thd, multi_stmt, ht);
 
+    }else {
+      worker->numUsedTables++;
     }
-    worker->numUsedTables++;
   }
   DBUG_RETURN(0);
 }
