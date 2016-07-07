@@ -166,20 +166,26 @@ static int fstr_commit(handlerton *hton, THD *thd, bool all){
       pthread_cond_wait(&req_shared->COND_work, &req_shared->LOCK_work_mutex);
     }
     pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
-
-
+    worker->commited=true;
     pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
-
     DBUG_RETURN(0);
+
+    void* null=0;
+    thd_set_ha_data(thd, hton, null);
+    pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
+    worker->aborted=false;
+    worker->commited=false;
+    worker_pool->pool.push_back(worker);
+    worker_pool->changed=true;
+    pthread_cond_broadcast(&worker_pool->COND_pool);
+    pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
   }
   DBUG_RETURN(0);
 }
 static int fstr_rollback(handlerton *hton, THD *thd, bool all){
   DBUG_ENTER("foster_rollback_func");
-  //  if(multi_stmt || all) {
   fstr_wrk_thr_t *worker = (fstr_wrk_thr_t *) thd_get_ha_data(thd, hton);
   shared_ptr<base_request_t> req_shared(new base_request_t);
-//  base_request_t *req = new base_request_t();
   //Locking work request mutex
   pthread_mutex_init(&req_shared->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
   pthread_mutex_lock(&req_shared->LOCK_work_mutex);
@@ -200,6 +206,16 @@ static int fstr_rollback(handlerton *hton, THD *thd, bool all){
   worker->aborted=true;
   pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
 
+
+  void* null=0;
+  thd_set_ha_data(thd, hton, null);
+  pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
+  worker->aborted=false;
+  worker->commited=false;
+  worker_pool->pool.push_back(worker);
+  worker_pool->changed=true;
+  pthread_cond_broadcast(&worker_pool->COND_pool);
+  pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
   DBUG_RETURN(0);
 }
 static int fstr_prepare(handlerton *hton, THD *thd, bool all){
@@ -1234,36 +1250,11 @@ int ha_foster::external_lock(THD *thd, int lock_type)
     {
       // end of statement
       if (!multi_stmt) {
-        if(!worker->aborted) {
-          shared_ptr<base_request_t> req_shared(new base_request_t);
-          //Locking work request mutex
-          pthread_mutex_init(&req_shared->LOCK_work_mutex, NULL);
-          pthread_mutex_lock(&req_shared->LOCK_work_mutex);
-          //Init the request condition -> used to signal the handler when the worker is done
-          pthread_cond_init(&req_shared->COND_work, NULL);
-
-          req_shared->type = FOSTER_COMMIT;
-          worker->set_shared_request(req_shared);
-          worker->notify(true);
-          pthread_mutex_lock(&worker->thread_mutex);
-          pthread_cond_signal(&worker->COND_worker);
-          pthread_mutex_unlock(&worker->thread_mutex);
-          while (!req_shared->notified) {
-            pthread_cond_wait(&req_shared->COND_work, &req_shared->LOCK_work_mutex);
-          }
-          pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
+        if(!worker->aborted && !worker->commited) {
+          //Auto-Commiting each statement
+          fstr_commit(ht,thd, true);
         }
       }
-      void* null=0;
-      thd_set_ha_data(thd, ht, null);
-
-      pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
-      worker->aborted=false;
-      worker_pool->pool.push_back(worker);
-      worker_pool->changed=true;
-      pthread_cond_broadcast(&worker_pool->COND_pool);
-      pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
-      worker=nullptr;
     }
   }
   else
@@ -1282,7 +1273,6 @@ int ha_foster::external_lock(THD *thd, int lock_type)
       worker->numUsedTables=1;
 
       shared_ptr<base_request_t> req_shared(new base_request_t);
-//      base_request_t *req = new base_request_t();
       //Locking work request mutex
       pthread_mutex_init(&req_shared->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
       pthread_mutex_lock(&req_shared->LOCK_work_mutex);
@@ -1311,6 +1301,7 @@ int ha_foster::external_lock(THD *thd, int lock_type)
       worker->numUsedTables++;
     }
   }
+
   DBUG_RETURN(0);
 }
 

@@ -276,6 +276,7 @@ public:
     pthread_mutex_t thread_mutex;
     int numUsedTables;
     bool aborted;
+    bool commited;
 
     pthread_cond_t COND_worker;
 
