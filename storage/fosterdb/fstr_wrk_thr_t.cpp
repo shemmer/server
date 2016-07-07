@@ -33,10 +33,12 @@ void fstr_wrk_thr_t::foster_exit(){
 
 
 void fstr_wrk_thr_t::foster_config(sm_options* options){
-    start_stop_request_t *start_req = static_cast<start_stop_request_t *>(req);
+    shared_ptr<start_stop_request_t> req_shared =
+            static_pointer_cast<start_stop_request_t>(shared_req);
+//    start_stop_request_t *start_req = static_cast<start_stop_request_t *>(req);
 
-    string logdir(start_req->logdir);
-    string opt_dbfile(start_req->db);
+    string logdir(req_shared->logdir);
+    string opt_dbfile(req_shared->db);
 
     string archdir;
     string opt_backup;
@@ -122,29 +124,30 @@ void fstr_wrk_thr_t::run(){
 
 int fstr_wrk_thr_t::work_ACTIVE(){
     w_rc_t err;
-    switch(req->type){
+
+    switch(shared_req->type){
         case FOSTER_STARTUP:
             err=startup();break;
         case FOSTER_SHUTDOWN:
             err=shutdown();break;
             case FOSTER_DISCOVERY:
-            err=discover_table(static_cast<discovery_request_t*>(req)); break;
+            err=discover_table(static_pointer_cast<discovery_request_t>(shared_req)); break;
         case FOSTER_CREATE:
-            err=create_physical_table(static_cast<ddl_request_t*>(req));break;
+            err=create_physical_table(static_pointer_cast<ddl_request_t>(shared_req));break;
         case FOSTER_DELETE:
-            err=delete_table(static_cast<ddl_request_t*>(req)); break;
+            err=delete_table(static_pointer_cast<ddl_request_t>(shared_req)); break;
         case FOSTER_WRITE_ROW:
-            err=add_tuple(static_cast<write_request_t*>(req)); break;
+            err=add_tuple(static_pointer_cast<write_request_t>(shared_req)); break;
         case FOSTER_UPDATE_ROW:
-            update_tuple(static_cast<write_request_t*>(req)); break;
+            update_tuple(static_pointer_cast<write_request_t>(shared_req)); break;
         case FOSTER_DELETE_ROW:
-            err=delete_tuple(static_cast<write_request_t*>(req)); break;
+            err=delete_tuple(static_pointer_cast<write_request_t>(shared_req)); break;
         case FOSTER_IDX_READ:
-            err=index_probe(static_cast<read_request_t*>(req)); break;
+            err=index_probe(static_pointer_cast<read_request_t>(shared_req)); break;
         case FOSTER_IDX_NEXT:
-            err=next(static_cast<read_request_t*>(req)); break;
+            err=next(static_pointer_cast<read_request_t>(shared_req)); break;
         case FOSTER_POS_READ:
-            err=position_read(static_cast<read_request_t*>(req)); break;
+            err=position_read(static_pointer_cast<read_request_t>(shared_req)); break;
         case FOSTER_COMMIT:
             err=foster_commit(); break;
         case FOSTER_ROLLBACK:
@@ -153,9 +156,9 @@ int fstr_wrk_thr_t::work_ACTIVE(){
             err=foster_begin(); break;
         default: break;
     }
-    req->err=translate_err_code(err.err_num());
-    req->notified=true;
-    pthread_cond_signal(&req->COND_work);
+    shared_req->err=translate_err_code(err.err_num());
+    shared_req->notified=true;
+    pthread_cond_signal(&shared_req->COND_work);
     return 0;
 }
 
@@ -223,7 +226,7 @@ w_keystr_t foster_key_copy(uchar *to_key, uchar *from_record, FosterIndexInfo::R
     return ret;
 }
 
-w_rc_t fstr_wrk_thr_t::create_physical_table(ddl_request_t* r){
+w_rc_t fstr_wrk_thr_t::create_physical_table(shared_ptr<ddl_request_t> r){
     StoreID cat_stid =1;
     StoreID primary_stid;
     W_COERCE(foster_begin());
@@ -234,8 +237,8 @@ w_rc_t fstr_wrk_thr_t::create_physical_table(ddl_request_t* r){
     construct_cat_key(
             const_cast<char*>(r->capnpTable.getDbname().asString().cStr()),
             (uint) r->capnpTable.getDbname().asString().size(),
-            const_cast<char*>(r->capnpTable.getDbname().asString().cStr()),
-            (uint) r->capnpTable.getDbname().asString().size(), cat_entry_key
+            const_cast<char*>(r->capnpTable.getTablename().asString().cStr()),
+            (uint) r->capnpTable.getTablename().asString().size(), cat_entry_key
     );
     ::capnp::List<FosterIndexInfo>::Builder indexes = r->capnpTable.getIndexes();
     FosterIndexInfo::Builder primary_idx = indexes[0];
@@ -262,7 +265,7 @@ w_rc_t fstr_wrk_thr_t::create_physical_table(ddl_request_t* r){
                     const_cast<char*>(curr_fk_req->referenced_db.c_str()),
                     curr_fk_req->referenced_db.length(),
                     const_cast<char*>(curr_fk_req->referenced_table.c_str()),
-            curr_fk_req->referenced_table.length(), ref_keystr);
+                     curr_fk_req->referenced_table.length(), ref_keystr);
             proto_curr_fk.setForeignTableId((char*) ref_keystr.serialize_as_nonkeystr().c_str());
 
             bool found;
@@ -408,7 +411,6 @@ w_rc_t fstr_wrk_thr_t::create_physical_table(ddl_request_t* r){
     w_rc_t err;
     kj::Array<capnp::word> words = messageToFlatArray(r->message);
     kj::ArrayPtr<kj::byte> bytes = words.asBytes();
-//    print_capnp_table(r->capnpTable);
     err =foster_handle->create_assoc(cat_stid, cat_entry_key,
                                          vec_t(bytes.begin(),bytes.size()));
     W_COERCE(foster_commit());
@@ -416,22 +418,18 @@ w_rc_t fstr_wrk_thr_t::create_physical_table(ddl_request_t* r){
 }
 
 
-w_rc_t fstr_wrk_thr_t::discover_table(discovery_request_t* r)
-{
-    w_keystr_t cat_entry_key ;
-    construct_cat_key(const_cast<char*>(r->db_name.c_str()),
-            r->db_name.length(), const_cast<char*>(r->table_name.c_str()),
-                      r->table_name.length(), cat_entry_key);
+w_rc_t fstr_wrk_thr_t::discover_table(shared_ptr<discovery_request_t> r){
+
     StoreID cat_stid =1;
     bool found;
     smsize_t size=1;
     capnp::word *buf = (capnp::word*) malloc(size);
     w_rc_t err;
-    err = ss_m::find_assoc(cat_stid, cat_entry_key, buf, size, found);
+    err = ss_m::find_assoc(cat_stid, *r->cat_entry_key, buf, size, found);
     if(!found) return RC(eINTERNAL);
     if(err.is_error() && err.err_num() == eRECWONTFIT){
         buf= (capnp::word*) realloc(buf, size);
-        ss_m::find_assoc(cat_stid, cat_entry_key, buf, size, found);
+        ss_m::find_assoc(cat_stid, *r->cat_entry_key, buf, size, found);
     }
     kj::ArrayPtr<const capnp::word> table_array_ptr= kj::arrayPtr(
                 reinterpret_cast<const capnp::word*>(buf),
@@ -440,7 +438,8 @@ w_rc_t fstr_wrk_thr_t::discover_table(discovery_request_t* r)
     return RCOK;
 }
 
-w_rc_t fstr_wrk_thr_t::delete_table(ddl_request_t* r) {
+
+w_rc_t fstr_wrk_thr_t::delete_table(shared_ptr<ddl_request_t> r) {
     StoreID cat_stid =1;
     w_rc_t err;
     w_keystr_t cat_entry_key;
@@ -456,7 +455,8 @@ w_rc_t fstr_wrk_thr_t::delete_table(ddl_request_t* r) {
 
 #include <btree.h>
 
-w_rc_t fstr_wrk_thr_t::add_tuple(write_request_t* r){
+
+w_rc_t fstr_wrk_thr_t::add_tuple(shared_ptr<write_request_t> r){
     w_rc_t rc = RCOK;
     if(r->table_info_array.size()==0) return RC(eINTERNAL);
     capnp::FlatArrayMessageReader fareader(r->table_info_array);
@@ -511,7 +511,8 @@ w_rc_t fstr_wrk_thr_t::add_tuple(write_request_t* r){
     return (rc);
 }
 
-w_rc_t fstr_wrk_thr_t::update_tuple(write_request_t* r){
+
+w_rc_t fstr_wrk_thr_t::update_tuple(shared_ptr<write_request_t> r){
     w_rc_t rc;
     if(r->table_info_array.size()==0) return RC(eINTERNAL);
     capnp::FlatArrayMessageReader fareader(r->table_info_array);
@@ -572,9 +573,6 @@ w_rc_t fstr_wrk_thr_t::update_tuple(write_request_t* r){
                 changed_sec=true;
             }
             if(changed_pk || changed_sec){
-//                delete_from_secondary_idx(sec_idx_stid,old_sec_kstr, old_pk_kstr);
-//                add_to_secondary_idx(sec_idx_stid,new_sec_kstr,new_pk_kstr);
-
                 delete_from_secondary_idx_uniquified(sec_idx_stid, old_sec_kstr, old_pk_kstr);
                 add_to_secondary_idx_uniquified(sec_idx_stid,new_sec_kstr, new_pk_kstr);
             }
@@ -583,7 +581,7 @@ w_rc_t fstr_wrk_thr_t::update_tuple(write_request_t* r){
     return rc;
 }
 
-w_rc_t fstr_wrk_thr_t::delete_tuple(write_request_t* r){
+w_rc_t fstr_wrk_thr_t::delete_tuple(shared_ptr<write_request_t> r){
     if(r->table_info_array.size()==0) return RC(eINTERNAL);
     capnp::FlatArrayMessageReader fareader(r->table_info_array);
     FosterTableInfo::Reader table_reader = fareader.getRoot<FosterTableInfo>();
@@ -602,7 +600,6 @@ w_rc_t fstr_wrk_thr_t::delete_tuple(write_request_t* r){
             FosterIndexInfo::Reader curr_index= indexes[idx];
             w_keystr_t sec_kstr= foster_key_copy(r->key_buf, r->mysql_format_buf, &curr_index);
             StoreID sec_idx_stid = curr_index.getStid();
-//            delete_from_secondary_idx(sec_idx_stid,sec_kstr, primary_kstr);
 
             delete_from_secondary_idx_uniquified(sec_idx_stid, sec_kstr, primary_kstr);
         }
@@ -649,17 +646,6 @@ w_rc_t fstr_wrk_thr_t::delete_tuple(write_request_t* r){
                                                              infimum,
                                                              false,
                                                              true);
-
-//                smsize_t foreign_sec_tuple_sz = 1;
-//                uchar *foreign_sec_tuple = (uchar *) malloc(foreign_sec_tuple_sz);
-//                err = ss_m::find_assoc(foreign_idx.getStid(), foreign_key_kstr,
-//                                       foreign_sec_tuple, foreign_sec_tuple_sz, found);
-//                if(!found) continue; //TODO errmsg corrupted foreign idx
-//                if (err.is_error() && err.err_num() == eRECWONTFIT) {
-//                    ref_buf = (capnp::word *) realloc(foreign_sec_tuple, foreign_sec_tuple_sz);
-//                    ss_m::find_assoc(foreign_idx.getStid(),
-//                                     foreign_key_kstr, foreign_sec_tuple, foreign_sec_tuple_sz, found);
-//                }
                 W_COERCE(foreign_cursor->next());
                 if(foreign_cursor->eof()) continue; //TODO errmsg corrupted foreign idx
                 int d = memcmp(foreign_key_kstr.buffer_as_keystr(),
@@ -686,7 +672,7 @@ w_rc_t fstr_wrk_thr_t::delete_tuple(write_request_t* r){
                     if(found){
                         switch(curr_ref.getAction()){
                             case capnp::schemas::Action_df51f652b4df6b49::CASCADE: {
-                                write_request_t *delete_foreign_req = new write_request_t();
+                                shared_ptr<write_request_t> delete_foreign_req(new write_request_t);
                                 delete_foreign_req->mysql_format_buf = foreign_tuple_buf;
                                 delete_foreign_req->key_buf = r->key_buf;
                                 delete_foreign_req->table_info_array = foreignTable_Array;
@@ -707,16 +693,6 @@ w_rc_t fstr_wrk_thr_t::delete_tuple(write_request_t* r){
                                    foreign_cursor->key().buffer_as_keystr(),
                                    foreign_key_kstr.get_length_as_keystr());
                 }
-
-//                uint numberOfRecs= foreign_sec_tuple[0];
-//                for(uchar* pos=++foreign_sec_tuple;
-//                    pos< (foreign_sec_tuple +foreign_sec_tuple_sz);
-//                    pos+= foreign_primary_idx.getKeylength()){
-//                    w_keystr_t curr_foreign_primary_kstr;
-//                    curr_foreign_primary_kstr.construct_regularkey(pos, foreign_primary_idx.getKeylength());
-//
-//
-//                }
                 free(foreign_tuple_buf);
             }
 
@@ -726,8 +702,7 @@ w_rc_t fstr_wrk_thr_t::delete_tuple(write_request_t* r){
 }
 
 
-
-w_rc_t fstr_wrk_thr_t::index_probe(read_request_t* r){
+w_rc_t fstr_wrk_thr_t::index_probe(shared_ptr<read_request_t> r){
     if(r->table_info_array.size()==0) return RC(eINTERNAL);
     capnp::FlatArrayMessageReader fareader(r->table_info_array);
     FosterTableInfo::Reader table_reader = fareader.getRoot<FosterTableInfo>();
@@ -834,9 +809,6 @@ w_rc_t fstr_wrk_thr_t::index_probe(read_request_t* r){
 
         uint pksz = indexes[0].getKeylength();
 
-        curr_numberOfRecs = (uint) cursor->elem()[0];
-        curr_element=0;
-
         w_keystr_t primarykstr;
         primarykstr.construct_regularkey(cursor->elem(), cursor->elen());
         smsize_t size=1;
@@ -856,7 +828,7 @@ w_rc_t fstr_wrk_thr_t::index_probe(read_request_t* r){
 
 }
 
-w_rc_t fstr_wrk_thr_t::next(read_request_t* r){
+w_rc_t fstr_wrk_thr_t::next(shared_ptr<read_request_t> r){
     if(r->table_info_array.size()==0) return RC(eINTERNAL);
     capnp::FlatArrayMessageReader fareader(r->table_info_array);
     FosterTableInfo::Reader table_reader = fareader.getRoot<FosterTableInfo>();
@@ -885,41 +857,6 @@ w_rc_t fstr_wrk_thr_t::next(read_request_t* r){
         }
         r->packed_record_buf= buf;
         r->packed_len=size;
-
-//        curr_element++;
-//        uint pksz=indexes[0].getKeylength();
-//        smsize_t size=1;
-//        uchar* buf= (uchar*) malloc(size);
-//        bool found;
-//        w_keystr_t kstr;
-//        if(curr_element<curr_numberOfRecs){
-//
-//            kstr.construct_regularkey(cursor->elem()+curr_element*pksz+1, pksz);
-//
-//            w_rc_t rc = foster_handle->find_assoc(indexes[0].getStid(),kstr, buf, size, found);
-//            if(rc.is_error() && rc.err_num()==eRECWONTFIT){
-//                buf= (uchar*) realloc(buf, size);
-//                foster_handle->find_assoc(indexes[0].getStid(), kstr, buf, size,found);
-//            }
-//            r->packed_record_buf= buf;
-//            r->packed_len=size;
-//        }else{
-//            W_COERCE(cursor->next());
-//            if(!cursor->eof()) {
-//                curr_numberOfRecs =(uint) cursor->elem()[0];
-//                curr_element=0;
-//                kstr.construct_regularkey( cursor->elem()+curr_element*pksz+1, pksz);
-//                w_rc_t rc = foster_handle->find_assoc(indexes[0].getStid(), kstr, buf, size, found);
-//                if (rc.is_error() && rc.err_num() == eRECWONTFIT) {
-//                    buf = (uchar *) realloc(buf, size);
-//                    foster_handle->find_assoc(indexes[0].getStid(), kstr, buf, size, found);
-//                }
-//                r->packed_record_buf= buf;
-//                r->packed_len=size;
-//            }else{
-//                return RC(se_TUPLE_NOT_FOUND);
-//            }
-//        }
     }else {
         W_COERCE(cursor->next());
         if (cursor->eof())
@@ -932,8 +869,7 @@ w_rc_t fstr_wrk_thr_t::next(read_request_t* r){
 }
 
 
-
-w_rc_t fstr_wrk_thr_t::position_read(read_request_t* r){
+w_rc_t fstr_wrk_thr_t::position_read(shared_ptr<read_request_t> r){
     if(r->table_info_array.size()==0) return RC(eINTERNAL);
     capnp::FlatArrayMessageReader fareader(r->table_info_array);
     FosterTableInfo::Reader table_reader = fareader.getRoot<FosterTableInfo>();

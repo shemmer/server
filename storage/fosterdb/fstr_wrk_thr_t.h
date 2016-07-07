@@ -36,6 +36,7 @@
 #include "cat_entries.capnp.h"
 #include <capnp/message.h>
 #include <capnp/serialize-packed.h>
+#include <memory>
 
 typedef struct st_fstr_fk_info
 {
@@ -90,8 +91,8 @@ struct base_request_t{
 typedef unsigned char uchar;
 
 struct discovery_request_t : base_request_t{
-    string db_name;
-    string table_name;
+
+    w_keystr_t* cat_entry_key;
 
     kj::ArrayPtr<const capnp::word> table_info_array;
 };
@@ -163,8 +164,6 @@ struct read_request_t : base_request_t{
 inline void construct_cat_key(char* db_name, uint db_len,
                                     char* table_name, uint table_name_len,
                               w_keystr_t& in){
-
-    w_keystr_t ret;
     char* temp = (char*) malloc(db_len+table_name_len+3);
     for(uint i=0; i<db_len; i++){
         temp[i]=db_name[i];
@@ -236,26 +235,25 @@ class fstr_wrk_thr_t : public smthread_t{
 
     base_request_t* req;
 
-    uint curr_numberOfRecs;
-    uint curr_element;
+    shared_ptr<base_request_t> shared_req;
 
     w_rc_t startup();
     w_rc_t shutdown();
 
     int work_ACTIVE();
 
-    w_rc_t discover_table(discovery_request_t* r);
+    w_rc_t discover_table(shared_ptr<discovery_request_t> r);
 
-    w_rc_t create_physical_table(ddl_request_t* r);
-    w_rc_t delete_table(ddl_request_t* r);
+    w_rc_t create_physical_table(shared_ptr<ddl_request_t> r);
+    w_rc_t delete_table(shared_ptr<ddl_request_t> r);
 
-    w_rc_t add_tuple(write_request_t* r);
-    w_rc_t delete_tuple(write_request_t* r);
-    w_rc_t update_tuple(write_request_t* r);
+    w_rc_t add_tuple(shared_ptr<write_request_t> r);
+    w_rc_t delete_tuple(shared_ptr<write_request_t> r);
+    w_rc_t update_tuple(shared_ptr<write_request_t> r);
 
-    w_rc_t index_probe(read_request_t* r);
-    w_rc_t next(read_request_t* r);
-    w_rc_t position_read(read_request_t* r);
+    w_rc_t index_probe(shared_ptr<read_request_t> r);
+    w_rc_t next(shared_ptr<read_request_t> r);
+    w_rc_t position_read(shared_ptr<read_request_t> r);
 
     void foster_config(sm_options* options);
 
@@ -284,8 +282,9 @@ public:
     fstr_wrk_thr_t();
 
     void run();
-    void set_request(base_request_t* r) {
-        req = r;
+
+    void set_shared_request(shared_ptr<base_request_t> r) {
+        shared_req= r;
     }
 
     inline void notify(bool notification){
