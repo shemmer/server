@@ -879,6 +879,7 @@ ha_rows ha_example::records_in_range(uint inx, key_range *min_key,
 int ha_example::create(const char *name, TABLE *table_arg,
                        HA_CREATE_INFO *create_info)
 {
+  THD* thd = ha_thd();
 #ifndef DBUG_OFF
   ha_table_option_struct *options= table_arg->s->option_struct;
   DBUG_ENTER("ha_example::create");

@@ -1301,7 +1301,6 @@ int ha_foster::external_lock(THD *thd, int lock_type)
       worker->numUsedTables++;
     }
   }
-
   DBUG_RETURN(0);
 }
 
