@@ -38,6 +38,39 @@
 #include <capnp/serialize-packed.h>
 #include <memory>
 
+typedef unsigned char uchar;
+typedef unsigned int uint32;
+
+typedef struct st_foster_record_buffer {
+    uchar *buffer;
+    uint32 length;
+
+    bool fix_rec_buff(unsigned int length){
+        assert(buffer);
+        if (this->length > length) {
+            uchar *newptr;
+            if (!(newptr = (uchar *) realloc(buffer, length)))
+                return false;
+            buffer = newptr;
+            this->length = length;
+        }
+        assert(buffer);
+        assert(length<=this->length);
+        return true;
+    }
+
+    st_foster_record_buffer(ulong length){
+        length= (int)length;
+        if(!(buffer= (uchar*) malloc(length)))
+        {
+            cerr<<" Cant create record_buffer"<<endl;
+        }
+    }
+    ~st_foster_record_buffer(){
+        free(buffer);
+    }
+} foster_record_buffer;
+
 typedef struct st_fstr_fk_info
 {
     string foreign_id;
@@ -88,7 +121,6 @@ struct base_request_t{
     int err;
 };
 
-typedef unsigned char uchar;
 
 struct discovery_request_t : base_request_t{
 
@@ -114,7 +146,7 @@ struct ddl_request_t : base_request_t{
 };
 
 struct write_request_t : base_request_t{
-    uchar* packed_record_buf;
+    foster_record_buffer* packed_record_buf;
     uint packed_len;
 
     uchar* mysql_format_buf;
@@ -151,7 +183,7 @@ struct read_request_t : base_request_t{
     uchar* key_buf;
     uint ksz;
 
-    uchar* packed_record_buf;
+    foster_record_buffer* packed_record_buf;
     uint packed_len;
 
     int len;
@@ -159,6 +191,8 @@ struct read_request_t : base_request_t{
     int idx_no;
 
     kj::ArrayPtr<const capnp::word> table_info_array;
+
+
 };
 
 inline void construct_cat_key(char* db_name, uint db_len,
@@ -265,12 +299,12 @@ class fstr_wrk_thr_t : public smthread_t{
     //TODO this is really ugly
     bool _find_exact=false;
 
-    int add_to_secondary_idx(StoreID sec_id, w_keystr_t secondary, w_keystr_t primary);
-    int delete_from_secondary_idx(StoreID sec_id, w_keystr_t sec_kstr, w_keystr_t primary);
+    void add_to_secondary_idx(StoreID sec_id, w_keystr_t secondary, w_keystr_t primary);
+    void delete_from_secondary_idx(StoreID sec_id, w_keystr_t sec_kstr, w_keystr_t primary);
 
 
-    int add_to_secondary_idx_uniquified(StoreID sec_id, w_keystr_t secondary, w_keystr_t primary);
-    int delete_from_secondary_idx_uniquified(StoreID sec_id, w_keystr_t sec_kstr, w_keystr_t primary);
+    void add_to_secondary_idx_uniquified(StoreID sec_id, w_keystr_t secondary, w_keystr_t primary);
+    void delete_from_secondary_idx_uniquified(StoreID sec_id, w_keystr_t sec_kstr, w_keystr_t primary);
 public:
 
     pthread_mutex_t thread_mutex;

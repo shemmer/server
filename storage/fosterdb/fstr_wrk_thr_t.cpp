@@ -496,7 +496,7 @@ w_rc_t fstr_wrk_thr_t::add_tuple(shared_ptr<write_request_t> r){
     StoreID pkstid = table_reader.getIndexes()[0].getStid();
     w_keystr_t kstr=foster_key_copy(r->key_buf, r->mysql_format_buf, &primaryIdx);
     //create assoc in primary
-    rc=foster_handle->bt->insert(pkstid, kstr, vec_t(r->packed_record_buf, r->packed_len));
+    rc=foster_handle->bt->insert(pkstid, kstr, vec_t(r->packed_record_buf->buffer, r->packed_len));
 
     if(rc.is_error()) { return rc;}
     if(table_reader.getIndexes().size()>1){
@@ -556,19 +556,27 @@ w_rc_t fstr_wrk_thr_t::update_tuple(shared_ptr<write_request_t> r){
     w_keystr_t old_pk_kstr=foster_key_copy(r->key_buf, r->old_mysql_format_buf, &primaryIdx);
 
     if(old_pk_kstr.compare(new_pk_kstr)!=0){
-        rc=foster_handle->bt->insert(pkstid, new_pk_kstr, vec_t(r->packed_record_buf, r->packed_len));
+        rc=foster_handle->bt->insert(pkstid,
+                                     new_pk_kstr,
+                                     vec_t(r->packed_record_buf->buffer, r->packed_len));
         rc=foster_handle->bt->remove(pkstid, old_pk_kstr);
         changed_pk=true;
     }else{
-        rc=foster_handle->bt->put(pkstid,new_pk_kstr, vec_t(r->packed_record_buf, r->packed_len));
+        rc=foster_handle->bt->put(pkstid,
+                                  new_pk_kstr,
+                                  vec_t(r->packed_record_buf->buffer, r->packed_len));
     }
     if(indexes.size()>1){
         bool changed_sec=false;
         for (uint idx = 1; idx < indexes.size(); idx++) {
             FosterIndexInfo::Reader curr_index= indexes[idx];
             StoreID sec_idx_stid = curr_index.getStid();
-            w_keystr_t new_sec_kstr= foster_key_copy(r->key_buf, r->mysql_format_buf, &curr_index);
-            w_keystr_t old_sec_kstr= foster_key_copy(r->key_buf, r->old_mysql_format_buf, &curr_index);
+            w_keystr_t new_sec_kstr= foster_key_copy(r->key_buf,
+                                                     r->mysql_format_buf,
+                                                     &curr_index);
+            w_keystr_t old_sec_kstr= foster_key_copy(r->key_buf,
+                                                     r->old_mysql_format_buf,
+                                                     &curr_index);
            if(old_sec_kstr.compare(new_sec_kstr)!=0){
                 changed_sec=true;
             }
@@ -593,12 +601,16 @@ w_rc_t fstr_wrk_thr_t::delete_tuple(shared_ptr<write_request_t> r){
         FosterIndexInfo::Reader index = indexes[i];
         rc=foster_handle->open_store(index.getStid(),root_pid,true);
     }
-    w_keystr_t primary_kstr=foster_key_copy(r->key_buf, r->mysql_format_buf, &primaryIdx);
+    w_keystr_t primary_kstr=foster_key_copy(r->key_buf,
+                                            r->mysql_format_buf,
+                                            &primaryIdx);
     rc=foster_handle->bt->remove(indexes[0].getStid(), primary_kstr);
     if(indexes.size()>1){
         for (uint idx = 1; idx < indexes.size(); idx++) {
             FosterIndexInfo::Reader curr_index= indexes[idx];
-            w_keystr_t sec_kstr= foster_key_copy(r->key_buf, r->mysql_format_buf, &curr_index);
+            w_keystr_t sec_kstr= foster_key_copy(r->key_buf,
+                                                 r->mysql_format_buf,
+                                                 &curr_index);
             StoreID sec_idx_stid = curr_index.getStid();
 
             delete_from_secondary_idx_uniquified(sec_idx_stid, sec_kstr, primary_kstr);
@@ -611,11 +623,13 @@ w_rc_t fstr_wrk_thr_t::delete_tuple(shared_ptr<write_request_t> r){
         for(uint i=0; i< ref_keys.size(); i++ ){
             FosterReferencingTable::Reader curr_ref = ref_keys[i];
             if(curr_ref.getType()==FosterReferencingTable::Type::DELETE) {
-                FosterIndexInfo::Reader referenced_idx = table_reader.getIndexes()[curr_ref.getReferencingIdxPos()];
+                FosterIndexInfo::Reader referenced_idx =
+                        table_reader.getIndexes()[curr_ref.getReferencingIdxPos()];
                 smsize_t fktable_cat_sz=1;
                 //Get information about the referencing (i.e. foreign) table from the catalog
                 w_keystr_t fktable_cat_keystr;
-                fktable_cat_keystr.construct_regularkey(curr_ref.getReferencingTable().cStr(), curr_ref.getReferencingTable().size());
+                fktable_cat_keystr.construct_regularkey(curr_ref.getReferencingTable().cStr(),
+                                                        curr_ref.getReferencingTable().size());
                 bool found;
                 capnp::word *ref_buf = (capnp::word *) malloc(fktable_cat_sz);
                 w_rc_t err;
@@ -636,8 +650,9 @@ w_rc_t fstr_wrk_thr_t::delete_tuple(shared_ptr<write_request_t> r){
                         foreignTableInfo.getIndexes()[curr_ref.getForeignIdxPos()];
 
                 //Get the foreign key that needs to be deleted from the referenced idx
-                w_keystr_t foreign_key_kstr=
-                        foster_key_copy(r->key_buf, r->mysql_format_buf, &referenced_idx);
+                w_keystr_t foreign_key_kstr=foster_key_copy(r->key_buf,
+                                                            r->mysql_format_buf,
+                                                            &referenced_idx);
                 w_keystr_t infimum;
                 infimum.construct_posinfkey();
                 bt_cursor_t* foreign_cursor = new bt_cursor_t(foreign_idx.getStid(),
@@ -693,11 +708,18 @@ w_rc_t fstr_wrk_thr_t::delete_tuple(shared_ptr<write_request_t> r){
                                    foreign_cursor->key().buffer_as_keystr(),
                                    foreign_key_kstr.get_length_as_keystr());
                 }
+//                delete(foreignTable_Array);
+//                delete(refreader);
+//                delete(foreign_key_kstr);
+                delete(foreign_cursor);
                 free(foreign_tuple_buf);
+                free(ref_buf);
             }
 
         }
     }
+//    delete(fareader);
+//    delete(table_reader);
     return (rc);
 }
 
@@ -802,29 +824,29 @@ w_rc_t fstr_wrk_thr_t::index_probe(shared_ptr<read_request_t> r){
     }
 
     if(r->idx_no==0) {
-        r->packed_record_buf= (uchar*) cursor->elem();
+        ::memcpy(r->packed_record_buf->buffer,cursor->elem(),cursor->elen());
+//        r->packed_record_buf= (uchar*) cursor->elem();
         r->packed_len= (uint) cursor->elen();
     }else{
         bool found;
-
         uint pksz = indexes[0].getKeylength();
-
         w_keystr_t primarykstr;
+        smsize_t size= r->packed_record_buf->length;
         primarykstr.construct_regularkey(cursor->elem(), cursor->elen());
-        smsize_t size=1;
-        uchar* buf= (uchar*) malloc(size);
         w_rc_t rc = foster_handle->find_assoc(indexes[0].getStid(),primarykstr,
-                                              buf, size, found);
+                                              r->packed_record_buf->buffer,
+                                              size,
+                                              found);
         if(!found) return RC(eINTERNAL); //TODO err msg corrupted index
         if(rc.is_error() && rc.err_num()==eRECWONTFIT){
-            buf= (uchar*) realloc(buf, size);
-            foster_handle->find_assoc(indexes[0].getStid(), primarykstr,
-                                      buf, size,found);
+            cerr<<"#### Record won't fit"<< endl;
+//            r->packed_record_buf= (uchar*) realloc( r->packed_record_buf, size);
+//            foster_handle->find_assoc(indexes[0].getStid(), primarykstr,
+//                                      r->packed_record_buf, size,found);
         }
-        r->packed_record_buf= buf;
         r->packed_len=size;
     }
-    return (RCOK);
+    return RCOK;
 
 }
 
@@ -845,24 +867,28 @@ w_rc_t fstr_wrk_thr_t::next(shared_ptr<read_request_t> r){
         if(d!=0 && _find_exact) return RC(se_TUPLE_NOT_FOUND);
         w_keystr_t primarykstr;
         primarykstr.construct_regularkey(cursor->elem(), cursor->elen());
-        smsize_t size=1;
-        uchar* buf= (uchar*) malloc(size);
+        smsize_t size=r->packed_record_buf->length;
+//        r->packed_record_buf= (uchar*) malloc(size);
         w_rc_t rc = foster_handle->find_assoc(indexes[0].getStid(),primarykstr,
-                                              buf, size, found);
+                                              r->packed_record_buf->buffer,
+                                              size,
+                                              found);
         if(!found) return RC(eINTERNAL); //TODO err msg corrupted index
         if(rc.is_error() && rc.err_num()==eRECWONTFIT){
-            buf= (uchar*) realloc(buf, size);
-            foster_handle->find_assoc(indexes[0].getStid(), primarykstr,
-                                      buf, size,found);
+            cerr<<"#### Record won't fit"<< endl;
+//            r->packed_record_buf= (uchar*) realloc( r->packed_record_buf, size);
+//            foster_handle->find_assoc(indexes[0].getStid(), primarykstr,
+//                                      r->packed_record_buf, size,found);
         }
-        r->packed_record_buf= buf;
         r->packed_len=size;
     }else {
         W_COERCE(cursor->next());
         if (cursor->eof())
             return RC(se_TUPLE_NOT_FOUND);
 
-        r->packed_record_buf= (uchar*) cursor->elem();
+
+        ::memcpy(r->packed_record_buf->buffer, cursor->elem(), cursor->elen());
+//        r->packed_record_buf= (uchar*) cursor->elem();
         r->packed_len= (uint) cursor->elen();
     }
     return RCOK;
@@ -878,22 +904,27 @@ w_rc_t fstr_wrk_thr_t::position_read(shared_ptr<read_request_t> r){
     w_rc_t rc;
     w_keystr_t kstr;
     kstr.construct_regularkey(r->key_buf, r->ksz);
-    uchar* buf;
-    smsize_t size=1;
-    buf= (uchar*) malloc(size);
-    rc = foster_handle->find_assoc(indexes[0].getStid(),kstr,buf,size, found);
+    smsize_t size=r->packed_record_buf->length;
+
+//    r->packed_record_buf= (uchar*) malloc(size);
+
+    rc = foster_handle->find_assoc(indexes[0].getStid(),
+                                   kstr,
+                                   r->packed_record_buf->buffer,
+                                   size,
+                                   found);
     if(rc.is_error() && rc.err_num()==eRECWONTFIT){
-        buf = (uchar *) realloc(buf, size);
-        rc = foster_handle->find_assoc(indexes[0].getStid(),kstr,buf,size, found);
+        cerr<<"#### Record won't fit"<< endl;
+//        r->packed_record_buf = (uchar *) realloc(r->packed_record_buf, size);
+//        rc = foster_handle->find_assoc(indexes[0].getStid(),kstr,r->packed_record_buf,size, found);
     }
-    r->packed_record_buf= buf;
     r->packed_len=size;
     return rc;
 }
 
 
 
-int fstr_wrk_thr_t::add_to_secondary_idx(StoreID sec_id, w_keystr_t sec_kstr, w_keystr_t primary){
+void fstr_wrk_thr_t::add_to_secondary_idx(StoreID sec_id, w_keystr_t sec_kstr, w_keystr_t primary){
 
     w_rc_t rc;
     bool found;
@@ -936,9 +967,6 @@ int fstr_wrk_thr_t::add_to_secondary_idx(StoreID sec_id, w_keystr_t sec_kstr, w_
             rc = foster_handle->bt->put(sec_id, sec_kstr, vec_t(new_buf, numberOfRecs * pksz + 1));
             free(new_buf);
             free(--record_buf);
-            return 0;
-        }else{
-            return 1;
         }
     }else{
         *record_buf++=1;
@@ -947,13 +975,12 @@ int fstr_wrk_thr_t::add_to_secondary_idx(StoreID sec_id, w_keystr_t sec_kstr, w_
         foster_handle->bt->insert(sec_id, sec_kstr,
                                   vec_t(record_buf, size)) ;
         free(record_buf);
-        return 0;
     }
 }
 
 
 
-int fstr_wrk_thr_t::add_to_secondary_idx_uniquified(StoreID sec_id, w_keystr_t sec_kstr, w_keystr_t primary){
+void fstr_wrk_thr_t::add_to_secondary_idx_uniquified(StoreID sec_id, w_keystr_t sec_kstr, w_keystr_t primary){
     w_rc_t rc;
     bool found;
     w_keystr_t uniquified;
@@ -967,7 +994,7 @@ int fstr_wrk_thr_t::add_to_secondary_idx_uniquified(StoreID sec_id, w_keystr_t s
 
 }
 
-int fstr_wrk_thr_t::delete_from_secondary_idx(StoreID sec_id, w_keystr_t sec_kstr, w_keystr_t primary){
+void fstr_wrk_thr_t::delete_from_secondary_idx(StoreID sec_id, w_keystr_t sec_kstr, w_keystr_t primary){
     w_rc_t rc;
     bool found;
     smsize_t size=primary.get_length_as_nonkeystr()+1;
@@ -984,7 +1011,7 @@ int fstr_wrk_thr_t::delete_from_secondary_idx(StoreID sec_id, w_keystr_t sec_kst
         uint numberOfRecs= record_buf[0]-1;
         if(numberOfRecs==0) {
             rc= foster_handle->bt->remove(sec_id, sec_kstr);
-            return 0;
+            return;
         }
 
         uchar* new_buf = (uchar*) malloc(numberOfRecs*pksz+1);
@@ -1007,14 +1034,10 @@ int fstr_wrk_thr_t::delete_from_secondary_idx(StoreID sec_id, w_keystr_t sec_kst
         free(tmp_pk_buffer);
         free(new_buf);
         free(--record_buf);
-        return 0;
-    }else{
-        return 1;
     }
-
 }
 
-int fstr_wrk_thr_t::delete_from_secondary_idx_uniquified(StoreID sec_id,
+void fstr_wrk_thr_t::delete_from_secondary_idx_uniquified(StoreID sec_id,
                                                          w_keystr_t sec_kstr,
                                                          w_keystr_t primary){
     w_rc_t rc;

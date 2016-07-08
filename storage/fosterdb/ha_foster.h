@@ -24,16 +24,11 @@
 //
 #include <config.h>
 
-#include "catEntries_generated.h"
+#include "fstr_wrk_thr_t.h"
 #include <handler.h>
 #include <cat_entries.capnp.h>
 #include <w_key.h>
 
-
-typedef struct st_foster_record_buffer {
-    uchar *buffer;
-    uint32 length;
-} foster_record_buffer;
 
 class FOSTER_SHARE: Handler_share{
 public:
@@ -54,7 +49,8 @@ public:
 };
 
 
-class fstr_wrk_thr_t;
+//class fstr_wrk_thr_t;
+//struct foster_record_buffer;
 /** @brief
   Class definition for the storage engine
 */
@@ -165,11 +161,6 @@ public:
     int create(const char *name, TABLE *form,
                HA_CREATE_INFO *create_info);                      ///< required
 
-    bool fix_rec_buff(unsigned int length);
-
-
-    void destroy_record_buffer(foster_record_buffer *r);
-    foster_record_buffer* create_record_buffer(ulong length);
 
     uint32 max_row_length(const uchar *buf);
     enum_alter_inplace_result
