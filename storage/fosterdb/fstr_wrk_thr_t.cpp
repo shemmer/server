@@ -756,6 +756,7 @@ w_rc_t fstr_wrk_thr_t::index_probe(shared_ptr<read_request_t> r){
     //Switch on search modes
     switch (r->find_flag) {
         case KEY_OR_NEXT:
+            _find_exact=false;
             cursor = new bt_cursor_t(idx_stid, kstr, true, infimum, false, true);
             W_COERCE(cursor->next());
             if (cursor->eof()) {
@@ -763,6 +764,7 @@ w_rc_t fstr_wrk_thr_t::index_probe(shared_ptr<read_request_t> r){
             }
             break;
         case KEY_OR_PREV:
+            _find_exact=false;
             cursor = new bt_cursor_t(idx_stid, supremum, true, kstr, false, false);
             W_COERCE(cursor->next());
             if (cursor->eof()) {
@@ -789,6 +791,7 @@ w_rc_t fstr_wrk_thr_t::index_probe(shared_ptr<read_request_t> r){
         }
             break;
         case AFTER_KEY: {
+            _find_exact=false;
             cursor = new bt_cursor_t(idx_stid, kstr, false, infimum, false, true);
             W_COERCE(cursor->next());
             if (cursor->eof()) {
@@ -805,6 +808,7 @@ w_rc_t fstr_wrk_thr_t::index_probe(shared_ptr<read_request_t> r){
         }
             break;
         case BEFORE_KEY: {
+            _find_exact=false;
             cursor = new bt_cursor_t(idx_stid, supremum, false, kstr, false, false);
             W_COERCE(cursor->next());
             if (cursor->eof()) {

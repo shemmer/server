@@ -46,11 +46,15 @@ typedef struct st_foster_record_buffer {
     uint32 length;
 
     bool fix_rec_buff(unsigned int length){
+
+        cerr<<"Fix record buffer " <<length<<"->"<<this->length<<endl;
         assert(buffer);
-        if (this->length > length) {
+        if (this->length < length) {
             uchar *newptr;
-            if (!(newptr = (uchar *) realloc(buffer, length)))
+            if (!(newptr = (uchar *) realloc(buffer, length))) {
+                cerr<<" Cant create record_buffer"<<endl;
                 return false;
+            }
             buffer = newptr;
             this->length = length;
         }
@@ -60,11 +64,13 @@ typedef struct st_foster_record_buffer {
     }
 
     st_foster_record_buffer(ulong length){
-        length= (int)length;
+        cerr<<"Create record buffer " <<length<<endl;
         if(!(buffer= (uchar*) malloc(length)))
         {
             cerr<<" Cant create record_buffer"<<endl;
+            return;
         }
+        this->length= (int)length;
     }
     ~st_foster_record_buffer(){
         free(buffer);

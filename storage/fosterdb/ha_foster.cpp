@@ -863,7 +863,7 @@ int ha_foster::update_row(const uchar *old_data, uchar *new_data)
   req_shared->old_mysql_format_buf= const_cast<uchar*>(old_data);
   req_shared->max_key_len=max_key_len;
 
-  if (record_buffer->fix_rec_buff(max_row_length(new_data)))
+  if (!record_buffer->fix_rec_buff(max_row_length(new_data)))
     DBUG_RETURN(HA_ERR_OUT_OF_MEM);
   req_shared->packed_record_buf=record_buffer;
 
