@@ -26,7 +26,6 @@
 #include <sql_class.h>
 
 #include "ha_foster.h"
-#include "fstr_wrk_thr_t.h"
 
 
 static FOSTER_SHARE *get_share(w_keystr_t table_name);
@@ -168,7 +167,6 @@ static int fstr_commit(handlerton *hton, THD *thd, bool all){
     pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
     worker->commited=true;
     pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
-    DBUG_RETURN(0);
 
     void* null=0;
     thd_set_ha_data(thd, hton, null);
@@ -351,9 +349,8 @@ static FOSTER_SHARE *get_share(w_keystr_t table_name)
                                              (uchar*) table_name.buffer_as_keystr(),
                                              length)))
   {
-    if (!my_multi_malloc(MYF(MY_WME | MY_ZEROFILL),
-                         &share, sizeof(*share),
-                         NullS))
+    share= (FOSTER_SHARE*) my_malloc(sizeof(*share), MYF(MY_WME | MY_ZEROFILL));
+    if (!share)
     {
       mysql_mutex_unlock(&foster_mutex);
       return NULL;
@@ -435,12 +432,10 @@ int ha_foster::open(const char *name, int mode, uint test_if_locked)
 
   table_name = name;
   ref_length = table->key_info[0].key_length;
-
+  max_key_name_len=0;
   for(uint i=0; i<table->s->keys; i++) {
-
-    if (max_key_name_len < table->key_info[i].name_length)
-      max_key_len = table->key_info[i].name_length;
-
+    if (max_key_len < table->key_info[i].key_length)
+      max_key_len = table->key_info[i].key_length;
   }
   max_key_len = max_key_len+table->s->keys*2;
   if(!share->initialized){
@@ -490,7 +485,7 @@ int ha_foster::open(const char *name, int mode, uint test_if_locked)
   if (key_buffer == 0)
     DBUG_RETURN(HA_ERR_OUT_OF_MEM);
 
-  record_buffer= create_record_buffer(table->s->reclength);
+ record_buffer= new foster_record_buffer(table->s->reclength);
   if (!record_buffer)
     DBUG_RETURN(HA_ERR_OUT_OF_MEM);
 
@@ -503,7 +498,7 @@ int ha_foster::close(void)
 {
   int rc= 0;
   DBUG_ENTER("ha_foster::close");
-  destroy_record_buffer(record_buffer);
+  delete(record_buffer);
   //if(key_buffer) free(key_buffer);
   DBUG_RETURN(free_share(share) || rc);
 }
@@ -823,11 +818,11 @@ int ha_foster::write_row(uchar *buf) {
 
   req_shared->mysql_format_buf=buf;
   req_shared->table_info_array=share->table_info_array;
-  if (fix_rec_buff(max_row_length(buf)))
+  if (!record_buffer->fix_rec_buff(max_row_length(buf)))
     DBUG_RETURN(HA_ERR_OUT_OF_MEM);
-  req_shared->packed_record_buf=record_buffer->buffer;
+  req_shared->packed_record_buf=record_buffer;
 
-  req_shared->packed_len= pack_row( buf, req_shared->packed_record_buf,table);
+  req_shared->packed_len= pack_row( buf, req_shared->packed_record_buf->buffer,table);
 
   req_shared->max_key_len=max_key_len;
 
@@ -868,11 +863,11 @@ int ha_foster::update_row(const uchar *old_data, uchar *new_data)
   req_shared->old_mysql_format_buf= const_cast<uchar*>(old_data);
   req_shared->max_key_len=max_key_len;
 
-  if (fix_rec_buff(max_row_length(new_data)))
+  if (record_buffer->fix_rec_buff(max_row_length(new_data)))
     DBUG_RETURN(HA_ERR_OUT_OF_MEM);
-  req_shared->packed_record_buf=record_buffer->buffer;
+  req_shared->packed_record_buf=record_buffer;
 
-  req_shared->packed_len= pack_row( new_data, req_shared->packed_record_buf,table);
+  req_shared->packed_len= pack_row( new_data, req_shared->packed_record_buf->buffer,table);
 
   req_shared->table_info_array=share->table_info_array;
   pthread_mutex_lock(&worker->thread_mutex);
@@ -909,7 +904,6 @@ int ha_foster::delete_row(const uchar *buf)
   req_shared->type = FOSTER_DELETE_ROW;
   req_shared->key_buf=key_buffer;
   req_shared->mysql_format_buf=const_cast<uchar*>(buf);
-//  req->table_info = &share->info;
   req_shared->max_key_len=max_key_len;
   req_shared->table_info_array=share->table_info_array;
 
@@ -954,6 +948,8 @@ int ha_foster::index_read_idx_map(uchar * buf, uint index, const uchar * key,
   //Init the request condition -> used to signal the handler when the worker is done
   pthread_cond_init(  &req_shared->COND_work, NULL);
 
+
+  req_shared->packed_record_buf=record_buffer;
   req_shared->type = FOSTER_IDX_READ;
   req_shared->key_buf = const_cast<uchar*>(key);
   req_shared->ksz=table->s->key_info[index].key_length;
@@ -975,7 +971,7 @@ int ha_foster::index_read_idx_map(uchar * buf, uint index, const uchar * key,
   pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
 
   if(req_shared->err==0){
-    unpack_row(req_shared->packed_record_buf,req_shared->packed_len, buf,table);
+    unpack_row(req_shared->packed_record_buf->buffer,req_shared->packed_len, buf,table);
     rc=0;
     pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
     table->status=0;
@@ -1007,6 +1003,8 @@ int ha_foster::index_read(uchar *buf, const uchar *key, uint key_len,
   req_shared->find_flag=translate_search_mode(find_flag);
   req_shared->idx_no=active_index;
 
+  req_shared->packed_record_buf=record_buffer;
+
   req_shared->table_info_array=share->table_info_array;
 
   pthread_mutex_lock(&worker->thread_mutex);
@@ -1021,7 +1019,7 @@ int ha_foster::index_read(uchar *buf, const uchar *key, uint key_len,
   pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
   rc=req_shared->err;
   if(req_shared->err==0){
-    unpack_row(req_shared->packed_record_buf,req_shared->packed_len, buf,table);
+    unpack_row(req_shared->packed_record_buf->buffer,req_shared->packed_len, buf,table);
     pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
     table->status=0;
   }else{
@@ -1050,6 +1048,8 @@ int ha_foster::index_next(uchar *buf)
 
   req_shared->table_info_array=share->table_info_array;
 
+  req_shared->packed_record_buf=record_buffer;
+
   pthread_mutex_lock(&worker->thread_mutex);
   worker->set_shared_request(req_shared);
   worker->notify(true);
@@ -1063,7 +1063,7 @@ int ha_foster::index_next(uchar *buf)
 
   rc=req_shared->err;
   if(req_shared->err==0){
-    unpack_row(req_shared->packed_record_buf,req_shared->packed_len, buf,table);
+    unpack_row(req_shared->packed_record_buf->buffer,req_shared->packed_len, buf,table);
     pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
     table->status=0;
   }else{
@@ -1122,6 +1122,9 @@ int ha_foster::rnd_next(uchar *buf)
   req_shared->idx_no=0;
   req_shared->table_info_array=share->table_info_array;
 
+
+  req_shared->packed_record_buf=record_buffer;
+
   if(first_row){
     first_row=false;
     req_shared->key_buf =0;
@@ -1145,7 +1148,7 @@ int ha_foster::rnd_next(uchar *buf)
   rc=req_shared->err;
 
   if(req_shared->err==0){
-    unpack_row(req_shared->packed_record_buf,req_shared->packed_len, buf,table);
+    unpack_row(req_shared->packed_record_buf->buffer,req_shared->packed_len, buf,table);
     pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
     table->status=0;
   }else{
@@ -1183,11 +1186,12 @@ int ha_foster::rnd_pos(uchar *buf, uchar *pos)
   //Init the request condition -> used to signal the handler when the worker is done
   pthread_cond_init(  &req_shared->COND_work, NULL);
 
-//  req->mysql_format_buf=buf;
   req_shared->key_buf=pos;
   req_shared->ksz=ref_length;
   req_shared->idx_no=0;
   req_shared->type=FOSTER_POS_READ;
+
+  req_shared->packed_record_buf=record_buffer;
 
   req_shared->table_info_array=share->table_info_array;
   pthread_mutex_lock(&worker->thread_mutex);
@@ -1203,7 +1207,7 @@ int ha_foster::rnd_pos(uchar *buf, uchar *pos)
 
   rc=req_shared->err;
   if(req_shared->err==0){
-    unpack_row(req_shared->packed_record_buf,req_shared->packed_len, buf,table);
+    unpack_row(req_shared->packed_record_buf->buffer,req_shared->packed_len, buf,table);
     pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
     table->status=0;
   }else{
@@ -1245,14 +1249,12 @@ int ha_foster::external_lock(THD *thd, int lock_type)
   worker = (fstr_wrk_thr_t*) thd_get_ha_data(thd, ht);
   if (lock_type == F_UNLCK)
   {
-    worker->numUsedTables--;
-    if (!worker->numUsedTables)
-    {
-      // end of statement
-      if (!multi_stmt) {
-        if(!worker->aborted && !worker->commited) {
-          //Auto-Commiting each statement
-          fstr_commit(ht,thd, true);
+    if(worker) {
+      worker->numUsedTables--;
+      if (!worker->numUsedTables) {
+        // end of statement
+        if (!multi_stmt) {
+            fstr_commit(ht, thd, true);
         }
       }
     }
@@ -1338,14 +1340,6 @@ ha_rows ha_foster::records_in_range(uint inx, key_range *min_key,
 }
 
 
-void ha_foster::destroy_record_buffer(foster_record_buffer *r)
-{
-  DBUG_ENTER("ha_foster::destroy_record_buffer");
-  my_free(r->buffer);
-  delete(r);
-  DBUG_VOID_RETURN;
-}
-
 /*
   Calculate max length needed for row. This includes
   the bytes required for the length in the header.
@@ -1369,43 +1363,9 @@ uint32 ha_foster::max_row_length(const uchar *buf)
 
 
 
-/* Reallocate buffer if needed */
-bool ha_foster::fix_rec_buff(unsigned int length) {
-  DBUG_ENTER("ha_foster::fix_rec_buff");
-  DBUG_PRINT("ha_foster", ("Fixing %u for %u",
-          length, record_buffer->length));
-  DBUG_ASSERT(record_buffer->buffer);
-
-  if (length > record_buffer->length) {
-    uchar *newptr;
-    if (!(newptr = (uchar *) my_realloc(record_buffer->buffer,
-                                        length,
-                                        MYF(MY_ALLOW_ZERO_PTR))))
-      DBUG_RETURN(1);
-    record_buffer->buffer = newptr;
-    record_buffer->length = length;
-  }
-
-  DBUG_ASSERT(length <= record_buffer->length);
-  DBUG_RETURN(0);
-}
 
 
 
-foster_record_buffer *ha_foster::create_record_buffer(ulong length)
-{
-  DBUG_ENTER("ha_foster::create_record_buffer");
-  foster_record_buffer *r = new foster_record_buffer();
-  r->length= (int)length;
-  if (!(r->buffer= (uchar*) my_malloc(r->length,
-                                      MYF(MY_WME))))
-  {
-    delete(r);
-    DBUG_RETURN(NULL);
-  }
-
-  DBUG_RETURN(r);
-}
 
 
 enum_alter_inplace_result
@@ -1453,13 +1413,13 @@ static MYSQL_SYSVAR_INT(
         worker,                       // name
         fstr_worker_num,                // varname
         PLUGIN_VAR_READONLY,            // opt
-        "Number of transaction workersbe", // comment
+        "Number of transaction workers", // comment
         NULL,                           // check
         NULL,                           // update
         1,
         20,
-        NULL,
-        10);
+        1,
+        5);
 
 static struct st_mysql_sys_var* foster_system_variables[]= {
         MYSQL_SYSVAR(db),
