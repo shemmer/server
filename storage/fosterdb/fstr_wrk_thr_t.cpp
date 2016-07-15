@@ -11,9 +11,7 @@ ss_m* fstr_wrk_thr_t::foster_handle;
 
 fstr_wrk_thr_t::fstr_wrk_thr_t():
          smthread_t(t_regular, "trx_worker"){
-//    init_foster_psi_keys();
-    pthread_mutex_init(&thread_mutex, NULL);
-    pthread_cond_init(&COND_worker, NULL);
+    worker_condex=new foster_condex();
     notified = false;
     aborted=false;
     this->fork();
@@ -22,13 +20,9 @@ fstr_wrk_thr_t::fstr_wrk_thr_t():
 
 
 void fstr_wrk_thr_t::foster_exit(){
-    pthread_mutex_lock(&thread_mutex);
-    notify(true);
     _exit=true;
-    pthread_cond_signal(&COND_worker);
-    pthread_mutex_unlock(&thread_mutex);
+    worker_condex->signal();
     join();
-    pthread_mutex_destroy(&thread_mutex);
 }
 
 
@@ -109,12 +103,7 @@ void fstr_wrk_thr_t::foster_config(sm_options* options){
 void fstr_wrk_thr_t::run(){
     int rval=0;
     while(true){
-        pthread_mutex_lock(&thread_mutex);
-        while(!notified){
-            pthread_cond_wait(&COND_worker, &thread_mutex);
-        }
-        pthread_mutex_unlock(&thread_mutex);
-        notified=false;
+        worker_condex->wait();
         if(_exit) return;
         rval = work_ACTIVE();
         if(rval) return;
@@ -158,11 +147,12 @@ int fstr_wrk_thr_t::work_ACTIVE(){
     }
     shared_req->err=translate_err_code(err.err_num());
     shared_req->notified=true;
-    pthread_cond_signal(&shared_req->COND_work);
+    shared_req->request_condex->signal();
     return 0;
 }
 
 w_rc_t fstr_wrk_thr_t::shutdown() {
+    foster_handle->set_shutdown_flag(true);
     delete(foster_handle);
     return RCOK;
 }
@@ -687,7 +677,7 @@ w_rc_t fstr_wrk_thr_t::delete_tuple(shared_ptr<write_request_t> r){
                     if(found){
                         switch(curr_ref.getAction()){
                             case capnp::schemas::Action_df51f652b4df6b49::CASCADE: {
-                                shared_ptr<write_request_t> delete_foreign_req(new write_request_t);
+                                shared_ptr<write_request_t> delete_foreign_req(new write_request_t(FOSTER_DELETE_ROW));
                                 delete_foreign_req->mysql_format_buf = foreign_tuple_buf;
                                 delete_foreign_req->key_buf = r->key_buf;
                                 delete_foreign_req->table_info_array = foreignTable_Array;
@@ -708,9 +698,6 @@ w_rc_t fstr_wrk_thr_t::delete_tuple(shared_ptr<write_request_t> r){
                                    foreign_cursor->key().buffer_as_keystr(),
                                    foreign_key_kstr.get_length_as_keystr());
                 }
-//                delete(foreignTable_Array);
-//                delete(refreader);
-//                delete(foreign_key_kstr);
                 delete(foreign_cursor);
                 free(foreign_tuple_buf);
                 free(ref_buf);
@@ -718,8 +705,6 @@ w_rc_t fstr_wrk_thr_t::delete_tuple(shared_ptr<write_request_t> r){
 
         }
     }
-//    delete(fareader);
-//    delete(table_reader);
     return (rc);
 }
 
@@ -829,7 +814,6 @@ w_rc_t fstr_wrk_thr_t::index_probe(shared_ptr<read_request_t> r){
 
     if(r->idx_no==0) {
         ::memcpy(r->packed_record_buf->buffer,cursor->elem(),cursor->elen());
-//        r->packed_record_buf= (uchar*) cursor->elem();
         r->packed_len= (uint) cursor->elen();
     }else{
         bool found;
@@ -842,12 +826,6 @@ w_rc_t fstr_wrk_thr_t::index_probe(shared_ptr<read_request_t> r){
                                               size,
                                               found);
         if(!found) return RC(eINTERNAL); //TODO err msg corrupted index
-        if(rc.is_error() && rc.err_num()==eRECWONTFIT){
-            cerr<<"#### Record won't fit"<< endl;
-//            r->packed_record_buf= (uchar*) realloc( r->packed_record_buf, size);
-//            foster_handle->find_assoc(indexes[0].getStid(), primarykstr,
-//                                      r->packed_record_buf, size,found);
-        }
         r->packed_len=size;
     }
     return RCOK;
@@ -872,18 +850,11 @@ w_rc_t fstr_wrk_thr_t::next(shared_ptr<read_request_t> r){
         w_keystr_t primarykstr;
         primarykstr.construct_regularkey(cursor->elem(), cursor->elen());
         smsize_t size=r->packed_record_buf->length;
-//        r->packed_record_buf= (uchar*) malloc(size);
         w_rc_t rc = foster_handle->find_assoc(indexes[0].getStid(),primarykstr,
                                               r->packed_record_buf->buffer,
                                               size,
                                               found);
         if(!found) return RC(eINTERNAL); //TODO err msg corrupted index
-        if(rc.is_error() && rc.err_num()==eRECWONTFIT){
-            cerr<<"#### Record won't fit"<< endl;
-//            r->packed_record_buf= (uchar*) realloc( r->packed_record_buf, size);
-//            foster_handle->find_assoc(indexes[0].getStid(), primarykstr,
-//                                      r->packed_record_buf, size,found);
-        }
         r->packed_len=size;
     }else {
         W_COERCE(cursor->next());
@@ -909,19 +880,11 @@ w_rc_t fstr_wrk_thr_t::position_read(shared_ptr<read_request_t> r){
     w_keystr_t kstr;
     kstr.construct_regularkey(r->key_buf, r->ksz);
     smsize_t size=r->packed_record_buf->length;
-
-//    r->packed_record_buf= (uchar*) malloc(size);
-
     rc = foster_handle->find_assoc(indexes[0].getStid(),
                                    kstr,
                                    r->packed_record_buf->buffer,
                                    size,
                                    found);
-    if(rc.is_error() && rc.err_num()==eRECWONTFIT){
-        cerr<<"#### Record won't fit"<< endl;
-//        r->packed_record_buf = (uchar *) realloc(r->packed_record_buf, size);
-//        rc = foster_handle->find_assoc(indexes[0].getStid(),kstr,r->packed_record_buf,size, found);
-    }
     r->packed_len=size;
     return rc;
 }
@@ -1069,3 +1032,4 @@ w_rc_t fstr_wrk_thr_t::foster_rollback(){
     W_COERCE(foster_handle->abort_xct());
     return RCOK;
 }
+

@@ -28,6 +28,88 @@
 #include "ha_foster.h"
 
 
+int translate_err_code(int err){
+  switch(err) {
+    case eDUPLICATE:
+      return HA_ERR_FOUND_DUPP_KEY;
+    case eINTERNAL:
+      return HA_ERR_INTERNAL_ERROR;
+    case stINTERNAL:
+      return HA_ERR_INTERNAL_ERROR;
+    case fcINTERNAL:
+      return HA_ERR_INTERNAL_ERROR;
+    case fcOS:
+      return HA_ERR_INTERNAL_ERROR;
+    case fcOUTOFMEMORY:
+      return HA_ERR_OUT_OF_MEM;
+    case eDEADLOCK:
+      return HA_ERR_LOCK_DEADLOCK;
+    case fcNOTIMPLEMENTED:
+      return HA_ERR_NO_REFERENCED_ROW;
+    case w_error_ok:
+      return 0;
+    default: return HA_ERR_INTERNAL_ERROR; break;
+  }
+}
+
+typedef struct st_fstr_wrk_thr_pool{
+    uint pool_size;
+    std::vector<fstr_wrk_thr_t*> pool;
+
+    pthread_mutex_t change_lock;
+    pthread_cond_t change_cond;
+
+    st_fstr_wrk_thr_pool(uint ps) {
+      if (pthread_mutex_init(&change_lock, NULL)) {
+        assert (0); // failed to init mutex
+      }
+      if (pthread_cond_init(&change_cond, NULL)) {
+        assert(0); //failed to init cond
+      }
+      pool_size = ps;
+      pool = *new std::vector<fstr_wrk_thr_t *>();
+      for (uint i = 0; i < pool_size; i++) {
+        fstr_wrk_thr_t *curr = new fstr_wrk_thr_t();
+        curr->translate_err_code = std::bind(translate_err_code, std::placeholders::_1);
+        curr->id = "fstr_wrk::" + std::to_string(i) ;
+        pool.push_back(curr);
+
+      }
+    }
+
+    ~st_fstr_wrk_thr_pool() {
+      pthread_mutex_lock(&change_lock);
+      for(uint i=0; i< pool_size; i++){
+        pool.at(i)->foster_exit();
+        delete(pool.at(i));
+      }
+      pthread_mutex_unlock(&change_lock);
+      pthread_mutex_destroy(&change_lock);
+        pthread_cond_destroy(&change_cond);
+    }
+
+    fstr_wrk_thr_t* take_worker(){
+      pthread_mutex_lock(&change_lock);
+      while(pool.empty()){
+        pthread_cond_wait(&change_cond,&change_lock);
+      }
+      fstr_wrk_thr_t* worker=pool.back();
+      pool.pop_back();
+      pthread_mutex_unlock(&change_lock);
+      return worker;
+    }
+
+    void give_worker_back(fstr_wrk_thr_t* worker){
+      pthread_mutex_lock(&change_lock);
+      worker->aborted=false;
+      worker->commited=false;
+      worker->cursor= nullptr;
+      pool.push_back(worker);
+      pthread_cond_signal(&change_cond);
+      pthread_mutex_unlock(&change_lock);
+    }
+}FOSTER_THREAD_POOL;
+
 static FOSTER_SHARE *get_share(w_keystr_t table_name);
 static int free_share(FOSTER_SHARE *share);
 static HASH foster_open_tables;
@@ -112,30 +194,6 @@ search_mode translate_search_mode(ha_rkey_function in){
   };
 }
 
-int translate_err_code(int err){
-  switch(err) {
-    case eDUPLICATE:
-      return HA_ERR_FOUND_DUPP_KEY;
-    case eINTERNAL:
-      return HA_ERR_INTERNAL_ERROR;
-    case stINTERNAL:
-      return HA_ERR_INTERNAL_ERROR;
-    case fcINTERNAL:
-      return HA_ERR_INTERNAL_ERROR;
-    case fcOS:
-      return HA_ERR_INTERNAL_ERROR;
-    case fcOUTOFMEMORY:
-      return HA_ERR_OUT_OF_MEM;
-    case eDEADLOCK:
-      return HA_ERR_LOCK_DEADLOCK;
-    case fcNOTIMPLEMENTED:
-      return HA_ERR_NO_REFERENCED_ROW;
-    case w_error_ok:
-      return 0;
-    default: return HA_ERR_INTERNAL_ERROR; break;
-  }
-}
-
 static uchar* foster_get_key(FOSTER_SHARE *share, size_t *length,
                              my_bool not_used __attribute__((unused)))
 {
@@ -147,73 +205,31 @@ static int fstr_commit(handlerton *hton, THD *thd, bool all){
   bool multi_stmt = (bool) thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
   if(multi_stmt || all) {
     fstr_wrk_thr_t *worker = (fstr_wrk_thr_t *) thd_get_ha_data(thd, hton);
-    shared_ptr<base_request_t> req_shared(new base_request_t);
-//    base_request_t *req = new base_request_t();
-    //Locking work request mutex
-    pthread_mutex_init(&req_shared->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
-    pthread_mutex_lock(&req_shared->LOCK_work_mutex);
-    //Init the request condition -> used to signal the handler when the worker is done
-    pthread_cond_init(  &req_shared->COND_work, NULL);
-
-    req_shared->type = FOSTER_COMMIT;
-    pthread_mutex_lock(&worker->thread_mutex);
+    shared_ptr<base_request_t> req_shared(new base_request_t(FOSTER_COMMIT));
     worker->set_shared_request(req_shared);
     worker->notify(true);
-    pthread_cond_signal(&worker->COND_worker);
-    pthread_mutex_unlock(&worker->thread_mutex);
-    while (!req_shared->notified) {
-      pthread_cond_wait(&req_shared->COND_work, &req_shared->LOCK_work_mutex);
+    worker->worker_condex->signal();
+    req_shared->request_condex->wait();
+    worker_pool->give_worker_back(worker);
+    thd_set_ha_data(thd, hton, nullptr);
     }
-    pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
-    worker->commited=true;
-    pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
-
-    void* null=0;
-    thd_set_ha_data(thd, hton, null);
-    pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
-    worker->aborted=false;
-    worker->commited=false;
-    worker_pool->pool.push_back(worker);
-    worker_pool->changed=true;
-    pthread_cond_broadcast(&worker_pool->COND_pool);
-    pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
-  }
   DBUG_RETURN(0);
 }
 static int fstr_rollback(handlerton *hton, THD *thd, bool all){
   DBUG_ENTER("foster_rollback_func");
   fstr_wrk_thr_t *worker = (fstr_wrk_thr_t *) thd_get_ha_data(thd, hton);
-  shared_ptr<base_request_t> req_shared(new base_request_t);
-  //Locking work request mutex
-  pthread_mutex_init(&req_shared->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
-  pthread_mutex_lock(&req_shared->LOCK_work_mutex);
-  //Init the request condition -> used to signal the handler when the worker is done
-  pthread_cond_init(  &req_shared->COND_work, NULL);
+  shared_ptr<base_request_t> req_shared(new base_request_t(FOSTER_ROLLBACK));
 
-  req_shared->type = FOSTER_ROLLBACK;
-
-  pthread_mutex_lock(&worker->thread_mutex);
   worker->set_shared_request(req_shared);
   worker->notify(true);
-  pthread_cond_signal(&worker->COND_worker);
-  pthread_mutex_unlock(&worker->thread_mutex);
-  while (!req_shared->notified) {
-    pthread_cond_wait(&req_shared->COND_work, &req_shared->LOCK_work_mutex);
-  }
-  pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
+  worker->worker_condex->signal();
+  req_shared->request_condex->wait();
   worker->aborted=true;
-  pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
-
 
   void* null=0;
   thd_set_ha_data(thd, hton, null);
-  pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
-  worker->aborted=false;
-  worker->commited=false;
-  worker_pool->pool.push_back(worker);
-  worker_pool->changed=true;
-  pthread_cond_broadcast(&worker_pool->COND_pool);
-  pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
+
+  worker_pool->give_worker_back(worker);
   DBUG_RETURN(0);
 }
 static int fstr_prepare(handlerton *hton, THD *thd, bool all){
@@ -243,14 +259,7 @@ static int foster_init_func(void *p)
   foster_hton->rollback=fstr_rollback;
   foster_hton->prepare=fstr_prepare;
 
-  shared_ptr<start_stop_request_t> req_shared(new start_stop_request_t);
-//  start_stop_request_t* req = new start_stop_request_t();
-  //Locking work request mutex
-  pthread_mutex_init(&req_shared->LOCK_work_mutex, NULL);
-  pthread_mutex_lock(&req_shared->LOCK_work_mutex);
-  //Init the request condition -> used to signal the handler when the worker is done
-  pthread_cond_init(  &req_shared->COND_work, NULL);
-  req_shared->type=FOSTER_STARTUP;
+  shared_ptr<start_stop_request_t> req_shared(new start_stop_request_t(FOSTER_STARTUP));
   req_shared->db=fstr_db_var;
   req_shared->logdir=fstr_logdir_var;
 
@@ -258,32 +267,14 @@ static int foster_init_func(void *p)
 
   ha_foster::main_thread->translate_err_code= std::bind(translate_err_code,
                                                         std::placeholders::_1);
-  pthread_mutex_lock(&ha_foster::main_thread->thread_mutex);
+
   ha_foster::main_thread->set_shared_request(req_shared);
   ha_foster::main_thread->notify(true);
-  pthread_cond_signal(&ha_foster::main_thread->COND_worker);
-  pthread_mutex_unlock(&ha_foster::main_thread->thread_mutex);
+  ha_foster::main_thread->worker_condex->signal();
 
-  while(!req_shared->notified){
-    pthread_cond_wait(&req_shared->COND_work, &req_shared->LOCK_work_mutex);
-  }
-  pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
-  pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
-
+  req_shared->request_condex->wait();
   //Initialize worker pool
-  worker_pool= new FOSTER_THREAD_POOL;
-  worker_pool->pool_size=fstr_worker_num;
-  pthread_mutex_init(&worker_pool->LOCK_pool_mutex, NULL);
-  pthread_cond_init(&worker_pool->COND_pool, NULL);
-  pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
-  worker_pool->changed=false;
-  worker_pool->pool=*new std::vector<fstr_wrk_thr_t*>();
-  for(int i=0; i< worker_pool->pool_size; i++){
-    fstr_wrk_thr_t* curr = new fstr_wrk_thr_t();
-    curr->translate_err_code= std::bind(translate_err_code, std::placeholders::_1);
-    worker_pool->pool.push_back(curr);
-  }
-  pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
+  worker_pool= new FOSTER_THREAD_POOL(fstr_worker_num);
   DBUG_RETURN(0);
 }
 
@@ -291,39 +282,16 @@ static int foster_init_func(void *p)
 static int foster_deinit_func(void *p){
   DBUG_ENTER("foster_deinit_func");
 
-  pthread_mutex_init(&worker_pool->LOCK_pool_mutex, NULL);
-  pthread_cond_init(&worker_pool->COND_pool, NULL);
-  pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
-  worker_pool->changed=false;
-  for(uint i=0; i< worker_pool->pool_size; i++){
-    worker_pool->pool.at(i)->foster_exit();
-    delete(worker_pool->pool.at(i));
-  }
-  pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
-  pthread_mutex_destroy(&worker_pool->LOCK_pool_mutex);
-  pthread_cond_destroy(&worker_pool->COND_pool);
   delete(worker_pool);
 
-  shared_ptr<start_stop_request_t> req_shared(new start_stop_request_t);
+  shared_ptr<start_stop_request_t> req_shared(new start_stop_request_t(FOSTER_SHUTDOWN));
 
-  //Locking work request mutex
-  pthread_mutex_init(&req_shared->LOCK_work_mutex, NULL);
-  pthread_mutex_lock(&req_shared->LOCK_work_mutex);
-  //Init the request condition -> used to signal the handler when the worker is done
-  pthread_cond_init(  &req_shared->COND_work, NULL);
 
-  req_shared->type=FOSTER_SHUTDOWN;
-
-  pthread_mutex_lock(&ha_foster::main_thread->thread_mutex);
   ha_foster::main_thread->set_shared_request(req_shared);
   ha_foster::main_thread->notify(true);
-  pthread_cond_broadcast(&ha_foster::main_thread->COND_worker);
-  pthread_mutex_unlock(&ha_foster::main_thread->thread_mutex);
+  ha_foster::main_thread->worker_condex->signal();
 
-  while(!req_shared->notified){
-    pthread_cond_wait(&req_shared->COND_work, &req_shared->LOCK_work_mutex);
-  }
-  pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
+  req_shared->request_condex->wait();
   ha_foster::main_thread->foster_exit();
   delete(ha_foster::main_thread);
   my_hash_free(&foster_open_tables);
@@ -439,46 +407,22 @@ int ha_foster::open(const char *name, int mode, uint test_if_locked)
   }
   max_key_len = max_key_len+table->s->keys*2;
   if(!share->initialized){
-    shared_ptr<discovery_request_t> req_shared(new discovery_request_t);
-//    discovery_request_t* req = new discovery_request_t();
-    req_shared->type=FOSTER_DISCOVERY;
-    pthread_mutex_init(&req_shared->LOCK_work_mutex, NULL);
-    //Init the request condition -> used to signal the handler when the worker is done
-    pthread_cond_init(  &req_shared->COND_work, NULL);
-    pthread_mutex_lock(&req_shared->LOCK_work_mutex);
 
+    fstr_wrk_thr_t* func_worker=new fstr_wrk_thr_t();
+    func_worker->translate_err_code = std::bind(translate_err_code, std::placeholders::_1);
+    func_worker->id = "fstr_wrk::discover_table_worker";
+
+    shared_ptr<discovery_request_t> req_shared(new discovery_request_t(FOSTER_DISCOVERY));
     req_shared->cat_entry_key=&normalized;
-
-    pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
-    while(worker_pool->pool.empty() && !worker_pool->changed){
-      pthread_cond_wait(&worker_pool->COND_pool, &worker_pool->LOCK_pool_mutex);
-    }
-    fstr_wrk_thr_t* func_worker =worker_pool->pool.back();
-    worker_pool->pool.pop_back();
-    worker_pool->changed=false;
-    pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
-
-    assert(func_worker);
-    pthread_mutex_lock(&func_worker->thread_mutex);
     func_worker->set_shared_request(req_shared);
     func_worker->notify(true);
-    pthread_cond_broadcast(&func_worker->COND_worker);
-    pthread_mutex_unlock(&func_worker->thread_mutex);
-
-    while(!req_shared->notified){
-      pthread_cond_wait(&req_shared->COND_work, &req_shared->LOCK_work_mutex);
-    }
-    pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
-
-    pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
-    worker_pool->pool.push_back(func_worker);
-    worker_pool->changed=true;
-    pthread_cond_broadcast(&worker_pool->COND_pool);
-    pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
-
+    func_worker->worker_condex->signal();
+    req_shared->request_condex->wait();
     share->table_info_array=req_shared->table_info_array;
     share->initialized=true;
-    pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
+
+    func_worker->foster_exit();
+    delete(func_worker);
   }
 
   key_buffer = (uchar*) my_malloc(max_key_len, MYF(MY_WME));
@@ -574,12 +518,8 @@ int ha_foster::create(const char *name, TABLE *table_arg,
 {
   int rc=0;
   DBUG_ENTER("ha_foster::create");
-  shared_ptr<ddl_request_t> req_shared(new ddl_request_t);
-
+  shared_ptr<ddl_request_t> req_shared(new ddl_request_t(FOSTER_CREATE));
   req_shared->capnpTable = req_shared->message.initRoot<FosterTableInfo>();
-  //Locking work request mutex
-  pthread_mutex_init(&req_shared->LOCK_work_mutex, NULL);
-  pthread_mutex_lock(&req_shared->LOCK_work_mutex);
   req_shared->foreign_keys = *new vector<FOSTER_FK_INFO>();
   req_shared->capnpTable.setTablename(table_arg->s->table_name.str);
   req_shared->capnpTable.setDbname(table_arg->s->db.str);
@@ -686,29 +626,16 @@ int ha_foster::create(const char *name, TABLE *table_arg,
   }
 
 
-  //Init the request condition -> used to signal the handler when the worker is done
-  pthread_cond_init(  &req_shared->COND_work, NULL);
-  req_shared->type=FOSTER_CREATE;
+  fstr_wrk_thr_t* func_worker=new fstr_wrk_thr_t();
+  func_worker->translate_err_code = std::bind(translate_err_code, std::placeholders::_1);
+  func_worker->id = "fstr_wrk::create_table_worker" ;
 
-  pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
-  while(worker_pool->pool.empty() && !worker_pool->changed){
-    pthread_cond_wait(&worker_pool->COND_pool, &worker_pool->LOCK_pool_mutex);
-  }
-  fstr_wrk_thr_t* func_worker =worker_pool->pool.back();
-  worker_pool->pool.pop_back();
-  worker_pool->changed=false;
-  pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
-
-  func_worker->translate_err_code= std::bind(translate_err_code, std::placeholders::_1);
-  pthread_mutex_lock(&func_worker->thread_mutex);
+  assert(func_worker);
   func_worker->set_shared_request(req_shared);
   func_worker->notify(true);
-  pthread_cond_broadcast(&func_worker->COND_worker);
-  pthread_mutex_unlock(&func_worker->thread_mutex);
+  func_worker->worker_condex->signal();
 
-  while(!req_shared->notified){
-    pthread_cond_wait(&req_shared->COND_work, &req_shared->LOCK_work_mutex);
-  }
+  req_shared->request_condex->wait();
 
   for(int i=0; i<req_shared->foreign_keys.size(); i++){
     w_keystr_t ref_cat;
@@ -725,14 +652,9 @@ int ha_foster::create(const char *name, TABLE *table_arg,
       mysql_mutex_unlock(&tmp->share_mutex);
     }
   }
-  pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
-  pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
 
-  pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
-  worker_pool->pool.push_back(func_worker);
-  worker_pool->changed=true;
-  pthread_cond_broadcast(&worker_pool->COND_pool);
-  pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
+  func_worker->foster_exit();
+  delete(func_worker);
   DBUG_RETURN(rc);
 }
 
@@ -742,25 +664,14 @@ int ha_foster::delete_table(const char *name)
 {
   int rc=0;
   DBUG_ENTER("ha_foster::delete_table");
-  shared_ptr<ddl_request_t> req_shared(new ddl_request_t);
-  pthread_mutex_init(&req_shared->LOCK_work_mutex, NULL);
-  pthread_mutex_lock(&req_shared->LOCK_work_mutex);
+  shared_ptr<ddl_request_t> req_shared(new ddl_request_t(FOSTER_DELETE));
 
-  //Init the request condition -> used to signal the handler when the worker is done
-  pthread_cond_init(  &req_shared->COND_work, NULL);
+  fstr_wrk_thr_t* func_worker=new fstr_wrk_thr_t();
+  func_worker->translate_err_code = std::bind(translate_err_code, std::placeholders::_1);
+  func_worker->id = "fstr_wrk::delete_table_worker" ;
 
-  pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
-  while(worker_pool->pool.empty() && !worker_pool->changed){
-    pthread_cond_wait(&worker_pool->COND_pool, &worker_pool->LOCK_pool_mutex);
-  }
-  fstr_wrk_thr_t* del_worker =worker_pool->pool.back();
-  worker_pool->pool.pop_back();
-  worker_pool->changed=false;
-  pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
 
-  del_worker->translate_err_code= std::bind(translate_err_code, std::placeholders::_1);
   string separator= "###";
-  req_shared->type=FOSTER_DELETE;
   req_shared->table_name= *new string();
   req_shared->db_name =*new string();
   bool first_slash= false;
@@ -777,43 +688,22 @@ int ha_foster::delete_table(const char *name)
     }
   }
 
-  pthread_mutex_lock(&del_worker->thread_mutex);
-  del_worker->set_shared_request(req_shared);
-  del_worker->notify(true);
-  pthread_cond_broadcast(&del_worker ->COND_worker);
-  pthread_mutex_unlock(&del_worker->thread_mutex);
+  func_worker->set_shared_request(req_shared);
+  func_worker->notify(true);
+  func_worker->worker_condex->signal();
 
-  while(!req_shared->notified){
-    pthread_cond_wait(&req_shared->COND_work, &req_shared->LOCK_work_mutex);
-  }
+  req_shared->request_condex->wait();
   rc=req_shared->err;
-  pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
-  pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
-
-  pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
-  worker_pool->pool.push_back(del_worker);
-  worker_pool->changed=true;
-  pthread_cond_broadcast(&worker_pool->COND_pool);
-  pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
-
+  func_worker->foster_exit();
+  delete(func_worker);
   DBUG_RETURN(rc);
 }
 
 int ha_foster::write_row(uchar *buf) {
   int rc=0;
   DBUG_ENTER("ha_foster::write_row");
-  shared_ptr<write_request_t> req_shared(new write_request_t);
-  //Locking work request mutex
-  pthread_mutex_init(&req_shared->LOCK_work_mutex, NULL);
-  pthread_mutex_lock(&req_shared->LOCK_work_mutex);
-  //Init the request condition -> used to signal the handler when the worker is done
-  pthread_cond_init(  &req_shared->COND_work, NULL);
+  shared_ptr<write_request_t> req_shared(new write_request_t(FOSTER_WRITE_ROW));
 
-  req_shared->type =FOSTER_WRITE_ROW;
-
-  worker->set_shared_request(req_shared);
-  //Initializing values of the request
-  req_shared->type = FOSTER_WRITE_ROW;
   req_shared->key_buf=key_buffer;
 
   req_shared->mysql_format_buf=buf;
@@ -826,105 +716,49 @@ int ha_foster::write_row(uchar *buf) {
 
   req_shared->max_key_len=max_key_len;
 
-  pthread_mutex_lock(&worker->thread_mutex);
   worker->set_shared_request(req_shared);
   worker->notify(true);
-  pthread_cond_broadcast(&worker->COND_worker);
-  pthread_mutex_unlock(&worker->thread_mutex);
-
-  while(!req_shared->notified){
-    pthread_cond_wait(&req_shared->COND_work, &req_shared->LOCK_work_mutex);
-  }
-  pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
-  rc=req_shared->err;
-  pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
-  DBUG_RETURN(rc);
+  worker->worker_condex->signal();
+  req_shared->request_condex->wait();
+  DBUG_RETURN(req_shared->err);
 }
 
 
 int ha_foster::update_row(const uchar *old_data, uchar *new_data)
 {
-  int rc=0;
   DBUG_ENTER("ha_foster::update_row");
-
-  shared_ptr<write_request_t> req_shared(new write_request_t);
-
-  //Locking work request mutex
-  pthread_mutex_init(&req_shared->LOCK_work_mutex, NULL);
-  pthread_mutex_lock(&req_shared->LOCK_work_mutex);
-
-  //Init the request condition -> used to signal the handler when the worker is done
-  pthread_cond_init(  &req_shared->COND_work, NULL);
-
-  req_shared->type = FOSTER_UPDATE_ROW;
+  shared_ptr<write_request_t> req_shared(new write_request_t(FOSTER_UPDATE_ROW));
   req_shared->key_buf=key_buffer;
-
   req_shared->mysql_format_buf=new_data;
   req_shared->old_mysql_format_buf= const_cast<uchar*>(old_data);
   req_shared->max_key_len=max_key_len;
-
   if (!record_buffer->fix_rec_buff(max_row_length(new_data)))
     DBUG_RETURN(HA_ERR_OUT_OF_MEM);
   req_shared->packed_record_buf=record_buffer;
-
   req_shared->packed_len= pack_row( new_data, req_shared->packed_record_buf->buffer,table);
-
   req_shared->table_info_array=share->table_info_array;
-  pthread_mutex_lock(&worker->thread_mutex);
   worker->set_shared_request(req_shared);
   worker->notify(true);
-  pthread_cond_broadcast(&worker->COND_worker);
-  pthread_mutex_unlock(&worker->thread_mutex);
-
-  while(!req_shared->notified){
-    pthread_cond_wait(&req_shared->COND_work, &req_shared->LOCK_work_mutex);
-  }
-
-  rc=req_shared->err;
-
-  pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
-
-  pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
-  DBUG_RETURN(rc);
+  worker->worker_condex->signal();
+  req_shared->request_condex->wait();
+  DBUG_RETURN(req_shared->err);
 }
 
 
 int ha_foster::delete_row(const uchar *buf)
 {
-  int rc=0;
   DBUG_ENTER("ha_foster::delete_row");
-
-  shared_ptr<write_request_t> req_shared(new write_request_t);
-  //Locking work request mutex
-  pthread_mutex_init(&req_shared->LOCK_work_mutex, NULL);
-  pthread_mutex_lock(&req_shared->LOCK_work_mutex);
-  //Init the request condition -> used to signal the handler when the worker is done
-  pthread_cond_init(  &req_shared->COND_work, NULL);
-
+  shared_ptr<write_request_t> req_shared(new write_request_t(FOSTER_DELETE_ROW));
   req_shared->type = FOSTER_DELETE_ROW;
   req_shared->key_buf=key_buffer;
   req_shared->mysql_format_buf=const_cast<uchar*>(buf);
   req_shared->max_key_len=max_key_len;
   req_shared->table_info_array=share->table_info_array;
-
-  pthread_mutex_lock(&worker->thread_mutex);
   worker->set_shared_request(req_shared);
   worker->notify(true);
-  pthread_cond_broadcast(&worker->COND_worker);
-  pthread_mutex_unlock(&worker->thread_mutex);
-
-  while(!req_shared->notified){
-    pthread_cond_wait(&req_shared->COND_work, &req_shared->LOCK_work_mutex);
-  }
-  pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
-  pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
-  if(req_shared->err==0){
-    table->status=0;
-    rc= 0;
-  }else{
-    rc=HA_ERR_END_OF_FILE;
-  }
-  DBUG_RETURN(rc);
+  worker->worker_condex->signal();
+  req_shared->request_condex->wait();
+  DBUG_RETURN(req_shared->err);
 }
 int ha_foster::index_init(uint idx, bool sorted){
   active_index=idx;
@@ -938,45 +772,24 @@ int ha_foster::index_read_idx_map(uchar * buf, uint index, const uchar * key,
                                   enum ha_rkey_function find_flag){
   int rc=0;
   DBUG_ENTER("ha_foster::index_read_idx_map");
-  shared_ptr<read_request_t> req_shared(new read_request_t);
-
-  table->status = 0;
-  //Locking work request mutex
-  pthread_mutex_init( &req_shared->LOCK_work_mutex, NULL);
-  pthread_mutex_lock(&req_shared->LOCK_work_mutex);
-
-  //Init the request condition -> used to signal the handler when the worker is done
-  pthread_cond_init(  &req_shared->COND_work, NULL);
-
+  shared_ptr<read_request_t> req_shared(new read_request_t(FOSTER_IDX_READ));
 
   req_shared->packed_record_buf=record_buffer;
-  req_shared->type = FOSTER_IDX_READ;
   req_shared->key_buf = const_cast<uchar*>(key);
   req_shared->ksz=table->s->key_info[index].key_length;
   req_shared->find_flag=translate_search_mode(find_flag);
-
   req_shared->idx_no=index;
   req_shared->table_info_array=share->table_info_array;
-  req_shared->idx_no = index;
 
-  pthread_mutex_lock(&worker->thread_mutex);
   worker->set_shared_request(req_shared);
   worker->notify(true);
-  pthread_cond_broadcast(&worker->COND_worker);
-  pthread_mutex_unlock(&worker->thread_mutex);
-
-  while(!req_shared->notified){
-    pthread_cond_wait(&req_shared->COND_work, &req_shared->LOCK_work_mutex);
-  }
-  pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
+  worker->worker_condex->signal();
+  req_shared->request_condex->wait();
 
   if(req_shared->err==0){
     unpack_row(req_shared->packed_record_buf->buffer,req_shared->packed_len, buf,table);
-    rc=0;
-    pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
     table->status=0;
   }else{
-    pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
     table->status = STATUS_NOT_FOUND;
     rc=HA_ERR_END_OF_FILE;
   }
@@ -988,42 +801,24 @@ int ha_foster::index_read(uchar *buf, const uchar *key, uint key_len,
   int rc=0;
   DBUG_ENTER("ha_foster::index_read");
 
-  shared_ptr<read_request_t> req_shared (new read_request_t);
+  shared_ptr<read_request_t> req_shared (new read_request_t(FOSTER_IDX_READ));
   table->status = 0;
-  //Locking work request mutex
-  pthread_mutex_init(&req_shared->LOCK_work_mutex, NULL);
-  pthread_mutex_lock(&req_shared->LOCK_work_mutex);
 
-  //Init the request condition -> used to signal the handler when the worker is done
-  pthread_cond_init(  &req_shared->COND_work, NULL);
-
-  req_shared->type = FOSTER_IDX_READ;
   req_shared->key_buf = const_cast<uchar*>(key);
   req_shared->ksz=key_len;
   req_shared->find_flag=translate_search_mode(find_flag);
   req_shared->idx_no=active_index;
-
   req_shared->packed_record_buf=record_buffer;
-
   req_shared->table_info_array=share->table_info_array;
 
-  pthread_mutex_lock(&worker->thread_mutex);
   worker->set_shared_request(req_shared);
   worker->notify(true);
-  pthread_cond_broadcast(&worker->COND_worker);
-  pthread_mutex_unlock(&worker->thread_mutex);
-
-  while(!req_shared->notified){
-    pthread_cond_wait(&req_shared->COND_work, &req_shared->LOCK_work_mutex);
-  }
-  pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
-  rc=req_shared->err;
+  worker->worker_condex->signal();
+  req_shared->request_condex->wait();
   if(req_shared->err==0){
     unpack_row(req_shared->packed_record_buf->buffer,req_shared->packed_len, buf,table);
-    pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
     table->status=0;
   }else{
-    pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
     table->status = STATUS_NOT_FOUND;
     rc=HA_ERR_END_OF_FILE;
   }
@@ -1034,40 +829,21 @@ int ha_foster::index_next(uchar *buf)
 {
   int rc=0;
   DBUG_ENTER("ha_foster::index_next");
-
-  shared_ptr<read_request_t> req_shared (new read_request_t);
-  table->status = 0;
-  //Locking work request mutex
-  pthread_mutex_init(&req_shared->LOCK_work_mutex, NULL);
-  pthread_mutex_lock(&req_shared->LOCK_work_mutex);
-
-  //Init the request condition -> used to signal the handler when the worker is done
-  pthread_cond_init(  &req_shared->COND_work, NULL);
+  shared_ptr<read_request_t> req_shared (new read_request_t(FOSTER_IDX_NEXT));
   req_shared->type = FOSTER_IDX_NEXT;
   req_shared->idx_no=active_index;
-
   req_shared->table_info_array=share->table_info_array;
-
   req_shared->packed_record_buf=record_buffer;
 
-  pthread_mutex_lock(&worker->thread_mutex);
   worker->set_shared_request(req_shared);
   worker->notify(true);
-  pthread_cond_broadcast(&worker->COND_worker);
-  pthread_mutex_unlock(&worker->thread_mutex);
+  worker->worker_condex->signal();
+  req_shared->request_condex->wait();
 
-  while(!req_shared->notified){
-    pthread_cond_wait(&req_shared->COND_work, &req_shared->LOCK_work_mutex);
-  }
-  pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
-
-  rc=req_shared->err;
   if(req_shared->err==0){
     unpack_row(req_shared->packed_record_buf->buffer,req_shared->packed_len, buf,table);
-    pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
     table->status=0;
   }else{
-    pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
     table->status = STATUS_NOT_FOUND;
     rc= HA_ERR_END_OF_FILE;
   }
@@ -1090,9 +866,7 @@ int ha_foster::index_last(uchar *buf)
 {
   int rc =0;
   DBUG_ENTER("ha_foster::index_last");
-
-  DBUG_RETURN(index_read(buf, 0, 0, HA_READ_PREFIX_LAST));
-
+  rc=index_read(buf, 0, 0, HA_READ_PREFIX_LAST);
   DBUG_RETURN(rc);
 }
 
@@ -1135,24 +909,16 @@ int ha_foster::rnd_next(uchar *buf)
     req_shared->type = FOSTER_IDX_NEXT;
   }
 
-  pthread_mutex_lock(&worker->thread_mutex);
   worker->set_shared_request(req_shared);
   worker->notify(true);
-  pthread_cond_broadcast(&worker->COND_worker);
-  pthread_mutex_unlock(&worker->thread_mutex);
+  worker->worker_condex->signal();
 
-  while(!req_shared->notified){
-    pthread_cond_wait(&req_shared->COND_work, &req_shared->LOCK_work_mutex);
-  }
-  pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
-  rc=req_shared->err;
+  req_shared->request_condex->wait();
 
   if(req_shared->err==0){
     unpack_row(req_shared->packed_record_buf->buffer,req_shared->packed_len, buf,table);
-    pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
     table->status=0;
   }else{
-    pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
     table->status = STATUS_NOT_FOUND;
     rc=HA_ERR_END_OF_FILE;
   }
@@ -1177,41 +943,23 @@ int ha_foster::rnd_pos(uchar *buf, uchar *pos)
 {
   int rc=0;
   DBUG_ENTER("ha_foster::rnd_pos");
-  shared_ptr<read_request_t> req_shared (new read_request_t);
-  table->status = 0;
-  //Locking work request mutex
-  pthread_mutex_init(&req_shared->LOCK_work_mutex, NULL);
-  pthread_mutex_lock(&req_shared->LOCK_work_mutex);
-
-  //Init the request condition -> used to signal the handler when the worker is done
-  pthread_cond_init(  &req_shared->COND_work, NULL);
-
+  shared_ptr<read_request_t> req_shared (new read_request_t(FOSTER_POS_READ));
   req_shared->key_buf=pos;
   req_shared->ksz=ref_length;
   req_shared->idx_no=0;
-  req_shared->type=FOSTER_POS_READ;
-
   req_shared->packed_record_buf=record_buffer;
-
   req_shared->table_info_array=share->table_info_array;
-  pthread_mutex_lock(&worker->thread_mutex);
+
   worker->set_shared_request(req_shared);
   worker->notify(true);
-  pthread_cond_broadcast(&worker->COND_worker);
-  pthread_mutex_unlock(&worker->thread_mutex);
+  worker->worker_condex->signal();
 
-  while(!req_shared->notified){
-    pthread_cond_wait(&req_shared->COND_work, &req_shared->LOCK_work_mutex);
-  }
-  pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
-
-  rc=req_shared->err;
+  req_shared->request_condex->wait();
   if(req_shared->err==0){
     unpack_row(req_shared->packed_record_buf->buffer,req_shared->packed_len, buf,table);
-    pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
+
     table->status=0;
   }else{
-    pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
     table->status = STATUS_NOT_FOUND;
     rc=HA_ERR_END_OF_FILE;
   }
@@ -1263,42 +1011,19 @@ int ha_foster::external_lock(THD *thd, int lock_type)
   {
     if (!worker)
     {
-      pthread_mutex_lock(&worker_pool->LOCK_pool_mutex);
-      // beginning of new transaction
-      while(worker_pool->pool.empty() && !worker_pool->changed){
-        pthread_cond_wait(&worker_pool->COND_pool, &worker_pool->LOCK_pool_mutex);
-      }
+      worker=worker_pool->take_worker();
+      assert(worker);
 
-      worker=worker_pool->pool.back();
-      worker_pool->pool.pop_back();
-      worker_pool->changed=false;
       worker->numUsedTables=1;
-
-      shared_ptr<base_request_t> req_shared(new base_request_t);
-      //Locking work request mutex
-      pthread_mutex_init(&req_shared->LOCK_work_mutex, MY_MUTEX_INIT_FAST);
-      pthread_mutex_lock(&req_shared->LOCK_work_mutex);
-      //Init the request condition -> used to signal the handler when the worker is done
-      pthread_cond_init(  &req_shared->COND_work, NULL);
-
-      req_shared->type = FOSTER_BEGIN;
+      shared_ptr<base_request_t> req_shared(new base_request_t(FOSTER_BEGIN));
       worker->set_shared_request(req_shared);
       worker->notify(true);
-      pthread_mutex_lock(&worker->thread_mutex);
-      worker->set_shared_request(req_shared);
-      worker->notify(true);
-      pthread_cond_signal(&worker->COND_worker);
-      pthread_mutex_unlock(&worker->thread_mutex);
-      while (!req_shared->notified) {
-        pthread_cond_wait(&req_shared->COND_work, &req_shared->LOCK_work_mutex);
-      }
-      pthread_mutex_unlock(&req_shared->LOCK_work_mutex);
-      pthread_mutex_destroy(&req_shared->LOCK_work_mutex);
-      pthread_mutex_unlock(&worker_pool->LOCK_pool_mutex);
 
+      worker->worker_condex->signal();
+
+      req_shared->request_condex->wait();
       thd_set_ha_data(thd, ht, worker);
       trans_register_ha(thd, multi_stmt, ht);
-
     }else {
       worker->numUsedTables++;
     }
@@ -1417,9 +1142,9 @@ static MYSQL_SYSVAR_INT(
         NULL,                           // check
         NULL,                           // update
         1,
-        20,
         1,
-        5);
+        20,
+        1);
 
 static struct st_mysql_sys_var* foster_system_variables[]= {
         MYSQL_SYSVAR(db),

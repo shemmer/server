@@ -37,17 +37,67 @@
 #include <capnp/message.h>
 #include <capnp/serialize-packed.h>
 #include <memory>
+#include <w.h>
 
 typedef unsigned char uchar;
 typedef unsigned int uint32;
+//TODO copied!
+enum search_mode {
+    KEY_EXACT,
+    KEY_OR_NEXT,
+    KEY_OR_PREV,
+    AFTER_KEY,
+    BEFORE_KEY,
+    PREFIX,
+    PREFIX_LAST,
+    PREFIX_LAST_OR_PREV,
+    UNKNOWN
+};
+
+
+typedef struct condex
+{
+    pthread_cond_t _cond;
+    pthread_mutex_t _lock;
+    long _signals;
+    long _waits;
+
+
+    condex() : _signals(0), _waits(0) {
+        if (pthread_cond_init(&_cond,NULL)) {
+            assert (0); // failed to init cond var
+        }
+        if (pthread_mutex_init(&_lock,NULL)) {
+            assert (0); // failed to init mutex
+        }
+    }
+
+    ~condex() {
+        pthread_cond_destroy(&_cond);
+        pthread_mutex_destroy(&_lock);
+    }
+
+    void signal() {
+        CRITICAL_SECTION(cs, _lock);
+        _signals++;
+        pthread_cond_signal(&_cond);
+    }
+
+    void wait() {
+        CRITICAL_SECTION(cs, _lock);
+        _waits++;
+        while(_waits > _signals)
+            pthread_cond_wait(&_cond,&_lock);
+    }
+
+} foster_condex;
+
 
 typedef struct st_foster_record_buffer {
     uchar *buffer;
     uint32 length;
 
     bool fix_rec_buff(unsigned int length){
-
-        cerr<<"Fix record buffer " <<length<<"->"<<this->length<<endl;
         assert(buffer);
         if (this->length < length) {
             uchar *newptr;
@@ -64,7 +114,6 @@ typedef struct st_foster_record_buffer {
     }
 
     st_foster_record_buffer(ulong length){
-        cerr<<"Create record buffer " <<length<<endl;
         if(!(buffer= (uchar*) malloc(length)))
         {
             cerr<<" Cant create record_buffer"<<endl;
@@ -118,37 +167,47 @@ const int FOSTER_ROLLBACK=21;
 const int FOSTER_BEGIN=22;
 
 struct base_request_t{
-    pthread_cond_t COND_work;
-    pthread_mutex_t LOCK_work_mutex;
-
+    foster_condex* request_condex;
     bool notified=false;
 
     int type;
     int err;
+
+    base_request_t(int t):
+            type(t), request_condex(new foster_condex()){
+
+    }
 };
 
 
 struct discovery_request_t : base_request_t{
-
     w_keystr_t* cat_entry_key;
-
     kj::ArrayPtr<const capnp::word> table_info_array;
+
+    discovery_request_t(int t):
+            base_request_t(t){
+    }
 };
 
 struct start_stop_request_t : base_request_t{
     char* db;
     char* logdir;
+    start_stop_request_t(int t):
+            base_request_t(t){
+    }
 };
 
 
 struct ddl_request_t : base_request_t{
     string table_name;
     string db_name;
-
     FosterTableInfo::Builder capnpTable =nullptr;
     ::capnp::MallocMessageBuilder message;
-
     std::vector<FOSTER_FK_INFO> foreign_keys;
+    ddl_request_t(int t):
+            base_request_t(t){
+    }
+
 };
 
 struct write_request_t : base_request_t{
@@ -168,19 +227,11 @@ struct write_request_t : base_request_t{
 
     kj::ArrayPtr<const capnp::word> table_info_array;
 
-};
 
-//TODO copied!
-enum search_mode {
-    KEY_EXACT,
-            KEY_OR_NEXT,
-            KEY_OR_PREV,
-            AFTER_KEY,
-            BEFORE_KEY,
-            PREFIX,
-            PREFIX_LAST,
-            PREFIX_LAST_OR_PREV,
-    UNKNOWN
+    write_request_t(int t):
+            base_request_t(t){
+    }
+
 };
 
 struct read_request_t : base_request_t{
@@ -198,8 +249,11 @@ struct read_request_t : base_request_t{
 
     kj::ArrayPtr<const capnp::word> table_info_array;
 
-
+    read_request_t(int t):
+            base_request_t(t){
+    }
 };
+
 
 inline void construct_cat_key(char* db_name, uint db_len,
                                     char* table_name, uint table_name_len,
@@ -271,8 +325,6 @@ class sm_options;
 class fstr_wrk_thr_t : public smthread_t{
     static ss_m* foster_handle;
 
-    bt_cursor_t* cursor;
-
     base_request_t* req;
 
     shared_ptr<base_request_t> shared_req;
@@ -312,13 +364,14 @@ class fstr_wrk_thr_t : public smthread_t{
     void add_to_secondary_idx_uniquified(StoreID sec_id, w_keystr_t secondary, w_keystr_t primary);
     void delete_from_secondary_idx_uniquified(StoreID sec_id, w_keystr_t sec_kstr, w_keystr_t primary);
 public:
-
-    pthread_mutex_t thread_mutex;
     int numUsedTables;
     bool aborted;
     bool commited;
 
-    pthread_cond_t COND_worker;
+
+    foster_condex* worker_condex;
+
+    bt_cursor_t* cursor;
 
     fstr_wrk_thr_t();
 
@@ -338,15 +391,10 @@ public:
     w_rc_t foster_rollback();
 
     std::function<int(int)> translate_err_code;
+
+
+    string id;
 };
 
-
-typedef struct st_fstr_wrk_thr_pool{
-    uint pool_size=10;
-    std::vector<fstr_wrk_thr_t*> pool;
-    pthread_mutex_t LOCK_pool_mutex;
-    pthread_cond_t COND_pool;
-    bool changed;
-}FOSTER_THREAD_POOL;
 
 #endif //MYSQL_FSTR_WRK_THR_H
