@@ -299,9 +299,6 @@ static int foster_deinit_func(void *p){
   DBUG_RETURN(0);
 }
 
-
-
-
 static FOSTER_SHARE *get_share(w_keystr_t table_name)
 {
   FOSTER_SHARE *share;
@@ -853,10 +850,8 @@ int ha_foster::index_next(uchar *buf)
 
 int ha_foster::index_first(uchar *buf)
 {
-
   int rc =0;
   DBUG_ENTER("ha_foster::index_first");
-
   rc= index_read(buf, 0, 0, HA_READ_KEY_OR_NEXT);
   DBUG_RETURN(rc);
 }
@@ -875,7 +870,6 @@ int ha_foster::index_last(uchar *buf)
 int ha_foster::rnd_init(bool scan)
 {
   DBUG_ENTER("ha_foster::rnd_init");
-
   first_row=true;
   active_index=0;
   DBUG_RETURN(0);
@@ -883,22 +877,13 @@ int ha_foster::rnd_init(bool scan)
 
 int ha_foster::rnd_next(uchar *buf)
 {
-  int rc;
+  int rc=0;
   DBUG_ENTER("ha_foster::rnd_next");
 
-  table->status = 0;
-
-  shared_ptr<read_request_t> req_shared (new read_request_t);
-  pthread_mutex_init(&req_shared->LOCK_work_mutex, NULL);
-  pthread_mutex_lock(&req_shared->LOCK_work_mutex);
-
-  pthread_cond_init(  &req_shared->COND_work, NULL);
+  shared_ptr<read_request_t> req_shared (new read_request_t(FOSTER_IDX_READ));
   req_shared->idx_no=0;
   req_shared->table_info_array=share->table_info_array;
-
-
   req_shared->packed_record_buf=record_buffer;
-
   if(first_row){
     first_row=false;
     req_shared->key_buf =0;
@@ -930,7 +915,6 @@ int ha_foster::rnd_next(uchar *buf)
 void ha_foster::position(const uchar *record)
 {
   DBUG_ENTER("ha_foster::position");
-
   key_copy(ref, const_cast<uchar*>(record),
            &table->key_info[0], 0);
   DBUG_VOID_RETURN;
@@ -1048,7 +1032,6 @@ THR_LOCK_DATA ** ha_foster::store_lock(THD *thd, THR_LOCK_DATA **to, enum thr_lo
       lockType = TL_READ;
     lock.type = lockType;
   }
-
   *to++ = &lock;
   return to;
 }
@@ -1085,11 +1068,6 @@ uint32 ha_foster::max_row_length(const uchar *buf)
 
   return length;
 }
-
-
-
-
-
 
 
 

@@ -113,7 +113,6 @@ void fstr_wrk_thr_t::run(){
 
 int fstr_wrk_thr_t::work_ACTIVE(){
     w_rc_t err;
-
     switch(shared_req->type){
         case FOSTER_STARTUP:
             err=startup();break;
@@ -195,7 +194,6 @@ w_keystr_t foster_key_copy(uchar *to_key, uchar *from_record, FosterIndexInfo::R
                 *keypos++=0;
             }
         }
-
         if(key_part.getBlob()|| key_part.getVarlength()){
             //the actual length of the varchar can also be stored in 2 bytes
             uint actualLength = (uint) from_record[key_part.getOffset()];
@@ -834,11 +832,12 @@ w_rc_t fstr_wrk_thr_t::index_probe(shared_ptr<read_request_t> r){
 
 w_rc_t fstr_wrk_thr_t::next(shared_ptr<read_request_t> r){
     if(r->table_info_array.size()==0) return RC(eINTERNAL);
+
     capnp::FlatArrayMessageReader fareader(r->table_info_array);
     FosterTableInfo::Reader table_reader = fareader.getRoot<FosterTableInfo>();
     capnp::List<FosterIndexInfo>::Reader indexes = table_reader.getIndexes();
-    if(r->idx_no!=0){
 
+    if(r->idx_no!=0){
         bool found;
         cursor->next();
         if(cursor->eof())

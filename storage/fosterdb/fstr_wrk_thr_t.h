@@ -138,7 +138,6 @@ typedef struct st_fstr_fk_info
     uint update_method=0;
     uint delete_method=0;
 
-
     std::vector<string> foreign_fields;
     std::vector<string> referenced_fields;
 
